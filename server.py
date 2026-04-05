@@ -1,40 +1,42 @@
-# server.py
+import asyncio
+import websockets
 import os
-from fastapi import FastAPI, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 
-app = FastAPI()
+connected_clients = {}  # {websocket: username}
 
-# Разрешаем CORS для всех (для теста EXE-клиентов)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Простая проверка HTTP
-@app.get("/")
-async def root():
-    return {"status": "ok"}
-
-# WebSocket путь
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("New client connected")
+async def handler(websocket):
     try:
-        while True:
-            message = await websocket.receive_text()
-            print(f"Received: {message}")
-            # Отправляем обратно pong
-            await websocket.send_text("pong")
-    except Exception:
-        print("Client disconnected")
-        await websocket.close()
+        # Получаем имя пользователя при подключении
+        name = await websocket.recv()
+        connected_clients[websocket] = name
+        print(f"{name} подключился")
 
-# Запуск через uvicorn
+        # Отправляем всем сообщение о новом подключении
+        for client in connected_clients:
+            if client != websocket:
+                await client.send(f"Сервер: {name} присоединился к чату")
+
+        async for message in websocket:
+            print(f"{name} пишет: {message}")
+            # Рассылаем всем клиентам
+            for client in connected_clients:
+                if client != websocket:
+                    await client.send(f"{name}: {message}")
+    except websockets.ConnectionClosed:
+        print(f"{connected_clients.get(websocket, 'Неизвестный')} отключился")
+    finally:
+        if websocket in connected_clients:
+            left_name = connected_clients[websocket]
+            del connected_clients[websocket]
+            # Сообщаем всем о выходе пользователя
+            for client in connected_clients:
+                await client.send(f"Сервер: {left_name} покинул чат")
+
+async def main():
+    port = int(os.environ.get("PORT", 8765))
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Server started on port {port}")
+        await asyncio.Future()  # держим сервер живым
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    asyncio.run(main())
