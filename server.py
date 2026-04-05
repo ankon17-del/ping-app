@@ -1,37 +1,35 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import os
+import asyncio
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 app = FastAPI()
+clients = set()
 
-clients = {}
+# CORS для безопасного теста, если нужно
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-
+    clients.add(websocket)
+    print(f"{websocket.client} connected")
     try:
-        name = await websocket.receive_text()
-        clients[websocket] = name
-
-        print(f"{name} подключился", flush=True)
-
         while True:
             data = await websocket.receive_text()
-            print(f"{name}: {data}", flush=True)
-
-            if data == "PING":
-                for client in clients:
-                    if client != websocket:
-                        await client.send_text("PING")
-
-            elif data.startswith("CHAT:"):
-                for client in clients:
-                    await client.send_text(data)
-
-    except WebSocketDisconnect:
-        print(f"{clients.get(websocket, 'Unknown')} отключился", flush=True)
-        clients.pop(websocket, None)
-
+            # Просто отправляем обратно всем клиентам
+            for client in clients:
+                await client.send_text(f"Ping from {data}")
+    except:
+        clients.remove(websocket)
+        print(f"{websocket.client} disconnected")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
