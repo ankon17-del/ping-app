@@ -1,66 +1,55 @@
 import asyncio
 import websockets
-import json
 import os
 
-# Словарь подключенных клиентов
-clients = {}
+clients = {}  # websocket -> name
 
-# URL к папке assets на Railway (поменяй на свой домен)
-ASSETS_URL = "https://ping-app-production-6ad4.up.railway.app/assets"
-
-async def handler(ws):
-    # Получаем имя пользователя
-    name = await ws.recv()
-    clients[name] = ws
-    print(f"{name} подключился")
-
-    # Уведомляем всех клиентов о статусе
-    await broadcast_status()
-
+async def handler(websocket):
     try:
-        async for msg in ws:
-            data = json.loads(msg)
+        # 1️⃣ При подключении клиент должен отправить своё имя
+        name = await websocket.recv()
+        clients[websocket] = name
 
-            # --- чат ---
-            if data.get("type") == "chat":
-                target = data.get("to")
-                if target in clients:
-                    await clients[target].send(json.dumps({
-                        "type": "chat",
-                        "from": name,
-                        "msg": data.get("msg")
-                    }))
+        print(f"{name} подключился", flush=True)
 
-            # --- пинг ---
-            elif data.get("type") == "ping":
-                target = data.get("to")
-                if target in clients:
-                    await clients[target].send(json.dumps({
-                        "type": "ping",
-                        "from": name,
-                        "sound_url": f"{ASSETS_URL}/ping_sound.mp3",
-                        "image_url": f"{ASSETS_URL}/popup_image.png"
-                    }))
+        # 2️⃣ Слушаем сообщения
+        async for message in websocket:
+            print(f"От {name}: {message}", flush=True)
+
+            # 🔔 Сигнал
+            if message.startswith("PING"):
+                for client in clients:
+                    if client != websocket:
+                        await client.send("PING")
+
+            # 💬 Чат
+            elif message.startswith("CHAT:"):
+                _, sender, text = message.split(":", 2)
+                for client in clients:
+                    await client.send(f"CHAT:{sender}:{text}")
+
+    except websockets.exceptions.ConnectionClosed:
+        print(f"{clients.get(websocket, 'Unknown')} отключился", flush=True)
+
     finally:
-        # Клиент отключился
-        if name in clients:
-            del clients[name]
-        await broadcast_status()
+        # удаляем клиента
+        if websocket in clients:
+            del clients[websocket]
 
-# Функция для обновления статусов всех клиентов
-async def broadcast_status():
-    status_data = {}
-    for user in ["you", "brother"]:
-        status_data[user] = user in clients
-    for ws in clients.values():
-        await ws.send(json.dumps({"type": "status", "status": status_data}))
 
-# Запуск сервера
+# 🚀 Запуск сервера
 async def main():
-    port = int(os.environ.get("PORT", 8765))  # Railway задаёт PORT автоматически
-    async with websockets.serve(handler, "0.0.0.0", port):
-        print("Server started")
-        await asyncio.Future()  # держим сервер запущенным
+    port = int(os.environ.get("PORT", 8080))  # Railway использует PORT
+    async with websockets.serve(
+        handler,
+        "0.0.0.0",
+        port,
+        ping_interval=20,
+        ping_timeout=20
+    ):
+        print(f"Server started on port {port}", flush=True)
+        await asyncio.Future()  # держим сервер живым
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
