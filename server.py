@@ -1,47 +1,48 @@
+# server.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import asyncio
-import websockets
-import os
 
-connected_clients = set()
-message_history = []
+app = FastAPI()
 
-async def handler(websocket):
-    # Получаем имя пользователя при подключении
-    username = await websocket.recv()
-    print(f"New client connected: {username}")
-    connected_clients.add(websocket)
+connected_clients = set()  # {(websocket, username)}
+message_history = []  # список всех сообщений
 
-    # Отправляем историю сообщений новому клиенту
-    for msg in message_history:
-        await websocket.send(msg)
-
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
     try:
-        async for message in websocket:
-            # Спецкоманда ping
-            if message == "__PING__":
-                for client in connected_clients:
-                    if client != websocket:
-                        await client.send(f"__PING__::{username}")
+        # Получаем имя пользователя при подключении
+        username = await websocket.receive_text()
+        connected_clients.add((websocket, username))
+        print(f"New client connected: {username}")
+        
+        # Отправляем историю сообщений новому клиенту
+        for msg in message_history:
+            await websocket.send_text(msg)
+        
+        while True:
+            msg = await websocket.receive_text()
+            
+            # Обработка Ping кнопки
+            if msg.startswith("__PING__"):
+                # Отправляем Ping другим пользователям
+                for ws, name in connected_clients:
+                    if ws != websocket:
+                        await ws.send_text(f"__PING__::{username}")
                 continue
 
-            # обычное сообщение
-            full_msg = f"{username}: {message}"
+            # Обычное сообщение
+            full_msg = f"{username}: {msg}"
             message_history.append(full_msg)
-
-            # рассылаем всем
-            for client in connected_clients:
-                await client.send(full_msg)
-
-    except websockets.ConnectionClosed:
+            
+            # Рассылаем всем клиентам
+            for ws, name in connected_clients:
+                await ws.send_text(full_msg)
+                
+    except WebSocketDisconnect:
+        connected_clients.remove((websocket, username))
         print(f"Client {username} disconnected")
-    finally:
-        connected_clients.remove(websocket)
-
-async def main():
-    port = int(os.environ.get("PORT", 8765))
-    async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Server started on port {port}")
-        await asyncio.Future()  # держим сервер живым
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        # Сообщаем остальным пользователям об отключении
+        for ws, name in connected_clients:
+            await ws.send_text(f"__DISCONNECT__::{username}")
