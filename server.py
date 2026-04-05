@@ -1,55 +1,37 @@
-import asyncio
-import websockets
-import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
 
-clients = {}  # websocket -> name
+app = FastAPI()
 
-async def handler(websocket):
+clients = {}
+
+@app.websocket("/")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
     try:
-        # 1️⃣ При подключении клиент должен отправить своё имя
-        name = await websocket.recv()
+        name = await websocket.receive_text()
         clients[websocket] = name
 
         print(f"{name} подключился", flush=True)
 
-        # 2️⃣ Слушаем сообщения
-        async for message in websocket:
-            print(f"От {name}: {message}", flush=True)
+        while True:
+            data = await websocket.receive_text()
+            print(f"{name}: {data}", flush=True)
 
-            # 🔔 Сигнал
-            if message.startswith("PING"):
+            if data == "PING":
                 for client in clients:
                     if client != websocket:
-                        await client.send("PING")
+                        await client.send_text("PING")
 
-            # 💬 Чат
-            elif message.startswith("CHAT:"):
-                _, sender, text = message.split(":", 2)
+            elif data.startswith("CHAT:"):
                 for client in clients:
-                    await client.send(f"CHAT:{sender}:{text}")
+                    await client.send_text(data)
 
-    except websockets.exceptions.ConnectionClosed:
+    except WebSocketDisconnect:
         print(f"{clients.get(websocket, 'Unknown')} отключился", flush=True)
-
-    finally:
-        # удаляем клиента
-        if websocket in clients:
-            del clients[websocket]
-
-
-# 🚀 Запуск сервера
-async def main():
-    port = int(os.environ.get("PORT", 8080))  # Railway использует PORT
-    async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        ping_interval=20,
-        ping_timeout=20
-    ):
-        print(f"Server started on port {port}", flush=True)
-        await asyncio.Future()  # держим сервер живым
+        clients.pop(websocket, None)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(app, host="0.0.0.0", port=8000)
