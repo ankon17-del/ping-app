@@ -1,35 +1,27 @@
-import os
 import asyncio
-from fastapi import FastAPI, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+import websockets
+import os
 
-app = FastAPI()
-clients = set()
-
-# CORS для безопасного теста, если нужно
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.websocket("/")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    clients.add(websocket)
-    print(f"{websocket.client} connected")
+# Обработчик сообщений от клиентов
+async def handler(websocket):
+    print("New client connected")
     try:
-        while True:
-            data = await websocket.receive_text()
-            # Просто отправляем обратно всем клиентам
-            for client in clients:
-                await client.send_text(f"Ping from {data}")
-    except:
-        clients.remove(websocket)
-        print(f"{websocket.client} disconnected")
+        async for message in websocket:
+            print(f"Received message: {message}")
+            # Отправляем обратно "pong" для проверки
+            await websocket.send("pong")
+    except websockets.ConnectionClosed:
+        print("Client disconnected")
+
+# Основная функция запуска сервера
+async def main():
+    # Railway назначает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 8765))
+    # Слушаем на всех интерфейсах
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Server started on port {port}")
+        await asyncio.Future()  # держим сервер живым
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Запуск asyncio цикла
+    asyncio.run(main())
