@@ -1,28 +1,47 @@
-from fastapi import FastAPI, WebSocket
 import asyncio
+import websockets
+import os
 
-app = FastAPI()
-connected_clients = {}
+connected_clients = set()
+message_history = []
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    username = await websocket.receive_text()
-    connected_clients[websocket] = username
+async def handler(websocket):
+    # Получаем имя пользователя при подключении
+    username = await websocket.recv()
     print(f"New client connected: {username}")
+    connected_clients.add(websocket)
+
+    # Отправляем историю сообщений новому клиенту
+    for msg in message_history:
+        await websocket.send(msg)
 
     try:
-        while True:
-            data = await websocket.receive_text()
-            if data.lower() == "ping":
+        async for message in websocket:
+            # Спецкоманда ping
+            if message == "__PING__":
                 for client in connected_clients:
                     if client != websocket:
-                        await client.send_text(f"Ping from {username}")
-            else:
-                for client in connected_clients:
-                    await client.send_text(f"{username}: {data}")
-    except Exception:
-        pass
+                        await client.send(f"__PING__::{username}")
+                continue
+
+            # обычное сообщение
+            full_msg = f"{username}: {message}"
+            message_history.append(full_msg)
+
+            # рассылаем всем
+            for client in connected_clients:
+                await client.send(full_msg)
+
+    except websockets.ConnectionClosed:
+        print(f"Client {username} disconnected")
     finally:
-        print(f"Client {connected_clients.get(websocket,'?')} disconnected")
-        connected_clients.pop(websocket, None)
+        connected_clients.remove(websocket)
+
+async def main():
+    port = int(os.environ.get("PORT", 8765))
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Server started on port {port}")
+        await asyncio.Future()  # держим сервер живым
+
+if __name__ == "__main__":
+    asyncio.run(main())
