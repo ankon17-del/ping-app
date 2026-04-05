@@ -1,27 +1,35 @@
-import asyncio
-import websockets
 import os
+import asyncio
+from fastapi import FastAPI, WebSocket
+import uvicorn
 
-# Обработчик сообщений от клиентов
-async def handler(websocket):
-    print("New client connected")
+app = FastAPI()
+
+clients = set()
+
+# HTTP проверка статуса (GET /)
+@app.get("/")
+async def root():
+    return {"status": "ok"}  # теперь Railway не будет выдавать 502
+
+# WebSocket endpoint
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    clients.add(websocket)
     try:
-        async for message in websocket:
-            print(f"Received message: {message}")
-            # Отправляем обратно "pong" для проверки
-            await websocket.send("pong")
-    except websockets.ConnectionClosed:
-        print("Client disconnected")
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+            else:
+                # эхо обратно
+                await websocket.send_text(data)
+    except:
+        clients.remove(websocket)
+        await websocket.close()
 
-# Основная функция запуска сервера
-async def main():
-    # Railway назначает порт через переменную окружения PORT
-    port = int(os.environ.get("PORT", 8765))
-    # Слушаем на всех интерфейсах
-    async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Server started on port {port}")
-        await asyncio.Future()  # держим сервер живым
-
+# Запуск сервера
 if __name__ == "__main__":
-    # Запуск asyncio цикла
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 8080))  # Railway назначает PORT
+    uvicorn.run(app, host="0.0.0.0", port=port)
