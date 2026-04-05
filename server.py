@@ -1,35 +1,39 @@
+import asyncio
+import websockets
 import os
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
-import uvicorn
 
-app = FastAPI()
-clients = set()
+connected_clients = {}  # websocket → username
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+async def handler(websocket):
     try:
         # Получаем имя пользователя при подключении
-        name = await websocket.receive_text()
-        print(f"New client connected: {name}")
-        clients.add((websocket, name))
+        username = await websocket.recv()
+        connected_clients[websocket] = username
+        print(f"New client connected: {username}")
 
-        while True:
-            message = await websocket.receive_text()
-            print(f"Received from {name}: {message}")
-            # Отправляем всем клиентам сообщение
-            for client, _ in clients:
-                await client.send_text(f"{name}: {message}")
-            # Отправка "pong" для кнопки пинг
+        async for message in websocket:
+            print(f"Received from {username}: {message}")
+
             if message.lower() == "ping":
-                await websocket.send_text("pong")
+                # Рассылаем Ping всем кроме отправителя
+                for client in connected_clients:
+                    if client != websocket:
+                        await client.send(f"Ping from {username}")
+            else:
+                # Рассылаем чат всем
+                for client in connected_clients:
+                    await client.send(f"{username}: {message}")
 
-    except Exception as e:
-        print(f"Client {name} disconnected: {e}")
+    except websockets.ConnectionClosed:
+        print(f"Client {connected_clients.get(websocket,'?')} disconnected")
     finally:
-        clients.remove((websocket, name))
+        connected_clients.pop(websocket, None)
+
+async def main():
+    port = int(os.environ.get("PORT", 8765))  # Railway назначает PORT
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Server started on port {port}")
+        await asyncio.Future()  # держим сервер живым
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))  # Railway назначает порт
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    asyncio.run(main())
