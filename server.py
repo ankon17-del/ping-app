@@ -1,14 +1,11 @@
+import json
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import asyncio
 import asyncpg
-import os
-import json
-import time
 
 app = FastAPI()
 
-# Разрешаем подключения
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,118 +14,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-connected_clients = set()
-
-
 # -------------------------
-# Модели запросов
+# PostgreSQL
 # -------------------------
-class RegisterData(BaseModel):
-    username: str
-    password: str
+DATABASE_URL = "postgres://..."  # твой DATABASE_URL
 
-
-class LoginData(BaseModel):
-    username: str
-    password: str
-
-
-# -------------------------
-# Подключение к БД
-# -------------------------
 async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
 
+# -------------------------
+# Подключенные клиенты
+# -------------------------
+connected_clients = set()  # (websocket, user_id, username)
+online_users = {}  # user_id: username
+
+async def broadcast_online():
+    """Рассылает всем клиентам список онлайн-пользователей"""
+    users_list = [{"user_id": uid, "username": uname} for uid, uname in online_users.items()]
+    message = json.dumps({"online": users_list})
+    dead_clients = []
+    for client_ws, client_uid, client_uname in connected_clients:
+        try:
+            await client_ws.send(message)
+        except Exception:
+            dead_clients.append((client_ws, client_uid, client_uname))
+    for dead in dead_clients:
+        connected_clients.discard(dead)
 
 # -------------------------
-# Проверка сервера
-# -------------------------
-@app.get("/")
-async def root():
-    return {"status": "Server is running"}
-
-
-# -------------------------
-# Регистрация
-# -------------------------
-@app.post("/register")
-async def register(data: RegisterData):
-    conn = await get_conn()
-    try:
-        existing = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1",
-            data.username
-        )
-
-        if existing:
-            return {"success": False, "message": "Username already exists"}
-
-        await conn.execute(
-            "INSERT INTO users (username, password) VALUES ($1, $2)",
-            data.username,
-            data.password
-        )
-
-        return {"success": True, "message": "Registered successfully"}
-
-    except Exception as e:
-        print("REGISTER ERROR:", e)
-        return {"success": False, "message": str(e)}
-
-    finally:
-        await conn.close()
-
-
-# -------------------------
-# Логин
-# -------------------------
-@app.post("/login")
-async def login(data: LoginData):
-    conn = await get_conn()
-    try:
-        user = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1 AND password=$2",
-            data.username,
-            data.password
-        )
-
-        if user:
-            return {
-                "success": True,
-                "user_id": user["id"],
-                "username": user["username"]
-            }
-        else:
-            return {"success": False, "message": "Invalid username or password"}
-
-    except Exception as e:
-        print("LOGIN ERROR:", e)
-        return {"success": False, "message": str(e)}
-
-    finally:
-        await conn.close()
-
-
-# -------------------------
-# WebSocket чат
+# WebSocket
 # -------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     conn = await get_conn()
-
     user_id = None
     username = None
 
     try:
-        # -------------------------
-        # Авторизация клиента
-        # -------------------------
         auth_raw = await websocket.receive_text()
         auth = json.loads(auth_raw)
-
         user_id = auth.get("user_id")
         username = auth.get("username")
 
@@ -136,72 +61,75 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        # Проверяем, что пользователь реально существует
-        user = await conn.fetchrow(
-            "SELECT id FROM users WHERE id=$1",
-            user_id
-        )
-
+        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
         if not user:
             await websocket.close()
             return
 
         connected_clients.add((websocket, user_id, username))
+        online_users[user_id] = username
+        await broadcast_online()
         print(f"User connected: {username} ({user_id})")
 
-        # -------------------------
-        # Отправляем историю сообщений
-        # -------------------------
-        rows = await conn.fetch("""
-            SELECT messages.text, users.username
-            FROM messages
-            JOIN users ON messages.user_id = users.id
-            ORDER BY messages.id ASC
-            LIMIT 100
-        """)
-
-        for row in rows:
-            await websocket.send_text(f"{row['username']}: {row['text']}")
-
-        # -------------------------
-        # Основной цикл чата
-        # -------------------------
         while True:
             msg_raw = await websocket.receive_text()
-            data = json.loads(msg_raw)
-
-            text = data.get("text", "").strip()
-            if not text:
-                continue
-
-            # Сохраняем сообщение в БД
-            await conn.execute(
-                "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
-                user_id,
-                text,
-                int(time.time())
-            )
-
-            # Формируем сообщение для рассылки
-            message_to_send = f"{username}: {text}"
-
-            dead_clients = []
-
-            for client_ws, client_user_id, client_username in connected_clients:
-                try:
-                    await client_ws.send_text(message_to_send)
-                except Exception:
-                    dead_clients.append((client_ws, client_user_id, client_username))
-
-            for dead in dead_clients:
-                connected_clients.discard(dead)
+            msg = json.loads(msg_raw)
+            # Сохраняем текстовые сообщения
+            if "text" in msg:
+                await conn.execute(
+                    "INSERT INTO messages(user_id, text, created_at) VALUES($1, $2, EXTRACT(EPOCH FROM NOW())::int)",
+                    user_id, msg["text"]
+                )
+                # Рассылаем всем обычное сообщение
+                for client_ws, _, _ in connected_clients:
+                    await client_ws.send(msg["text"])
+            # Обработка ping
+            elif msg.get("ping"):
+                for client_ws, client_uid, _ in connected_clients:
+                    if client_uid != user_id:
+                        await client_ws.send(json.dumps(msg))
 
     except Exception as e:
-        print("WebSocket error:", e)
-
+        print(f"WebSocket error: {e}")
     finally:
-        if user_id and username:
+        # Убираем пользователя из онлайн и соединений
+        if (websocket, user_id, username) in connected_clients:
             connected_clients.discard((websocket, user_id, username))
-            print(f"User disconnected: {username} ({user_id})")
+        if user_id in online_users:
+            online_users.pop(user_id)
+        await broadcast_online()
+        await conn.close()
+        print(f"User disconnected: {username} ({user_id})")
 
+# -------------------------
+# HTTP для регистрации/логина
+# -------------------------
+from fastapi import Request
+
+@app.post("/register")
+async def register(request: Request):
+    data = await request.json()
+    username = data.get("username")
+    password = data.get("password")
+    conn = await get_conn()
+    try:
+        await conn.execute("INSERT INTO users(username, password) VALUES($1, $2)", username, password)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+    finally:
+        await conn.close()
+
+@app.post("/login")
+async def login(request: Request):
+    data = await request.json()
+    username = data.get("username")
+    password = data.get("password")
+    conn = await get_conn()
+    try:
+        user = await conn.fetchrow("SELECT id, username FROM users WHERE username=$1 AND password=$2", username, password)
+        if not user:
+            return {"success": False, "message": "Неверный логин или пароль"}
+        return {"success": True, "user_id": user["id"], "username": user["username"]}
+    finally:
         await conn.close()
