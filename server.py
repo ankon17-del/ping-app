@@ -20,39 +20,31 @@ app.add_middleware(
 )
 
 # -------------------------
-# DATABASE_URL
-# -------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан! Проверь переменные окружения на Railway")
+    raise RuntimeError("DATABASE_URL не задан!")
 
 # -------------------------
 # Подключение к базе
-# -------------------------
 async def get_conn():
-    conn = await asyncpg.connect(DATABASE_URL)
-    return conn
+    return await asyncpg.connect(DATABASE_URL)
 
 # -------------------------
-# Подключенные клиенты
-# -------------------------
 connected_clients = set()  # (websocket, user_id, username)
-online_users = {}  # user_id -> username
+online_users = {}          # user_id -> username
 
 async def broadcast_online():
     users_list = [{"user_id": uid, "username": uname} for uid, uname in online_users.items()]
     message = json.dumps({"online": users_list})
     dead_clients = []
-    for ws, uid, uname in connected_clients:
+    for ws, _, _ in connected_clients:
         try:
             await ws.send(message)
-        except Exception:
-            dead_clients.append((ws, uid, uname))
+        except:
+            dead_clients.append((ws, _, _))
     for dead in dead_clients:
         connected_clients.discard(dead)
 
-# -------------------------
-# WebSocket
 # -------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -81,7 +73,8 @@ async def websocket_endpoint(websocket: WebSocket):
         await broadcast_online()
         print(f"User connected: {username} ({user_id})")
 
-        # Отправляем историю сообщений
+        # -------------------------
+        # Отправка истории сообщений
         rows = await conn.fetch(
             "SELECT users.username, messages.text FROM messages "
             "JOIN users ON messages.user_id = users.id ORDER BY messages.id ASC"
@@ -93,12 +86,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 "text": row["text"]
             }))
 
+        # -------------------------
         # Основной цикл
         while True:
             msg_raw = await websocket.receive_text()
-            msg = json.loads(msg_raw)
+            try:
+                msg = json.loads(msg_raw)
+            except:
+                continue  # если не JSON, пропускаем
 
-            # Текстовое сообщение
+            # текстовое сообщение
             if "text" in msg:
                 await conn.execute(
                     "INSERT INTO messages(user_id, text, created_at) VALUES($1, $2, EXTRACT(EPOCH FROM NOW())::int)",
@@ -127,8 +124,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await conn.close()
         print(f"User disconnected: {username} ({user_id})")
 
-# -------------------------
-# HTTP: регистрация и логин
 # -------------------------
 @app.post("/register")
 async def register(request: Request):
@@ -159,7 +154,8 @@ async def login(request: Request):
             return {"success": False, "message": "Имя и пароль обязательны"}
 
         user = await conn.fetchrow(
-            "SELECT id, username FROM users WHERE username=$1 AND password=$2", username, password
+            "SELECT id, username FROM users WHERE username=$1 AND password=$2",
+            username, password
         )
         if not user:
             return {"success": False, "message": "Неверный логин или пароль"}
