@@ -5,6 +5,7 @@ import asyncio
 import asyncpg
 import os
 from datetime import datetime
+import json   # <- вот это добавляем
 
 app = FastAPI()
 
