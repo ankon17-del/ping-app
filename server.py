@@ -1,117 +1,142 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+# server.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 import asyncio
 import asyncpg
 import os
-import json
-import time
+from datetime import datetime
 
 app = FastAPI()
 
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Переменная на Railway
+# -------------------------
+# Подключение к базе PostgreSQL
+# -------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")  # переменная на Railway
 
-# --------------------------
-# Подключение к PostgreSQL
-# --------------------------
-async def get_db_pool():
-    if not hasattr(app.state, "db_pool"):
-        app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
-    return app.state.db_pool
+conn = None  # глобальная переменная для соединения
 
-# --------------------------
-# Пользователи
-# --------------------------
+async def get_conn():
+    global conn
+    if conn is None:
+        conn = await asyncpg.connect(DATABASE_URL)
+    return conn
+
+# -------------------------
+# Таблицы
+# -------------------------
+# users(id serial primary key, username text unique, password text)
+# messages(id serial primary key, user_id integer, text text, created_at integer)
+
+# -------------------------
+# HTTP endpoints
+# -------------------------
 @app.post("/register")
-async def register_user(data: dict):
+async def register_user(req: Request):
+    data = await req.json()
     username = data.get("username")
     password = data.get("password")
     if not username or not password:
-        raise HTTPException(status_code=400, detail="username and password required")
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        # Проверяем, есть ли уже пользователь
-        existing = await conn.fetchrow("SELECT * FROM users WHERE username=$1", username)
-        if existing:
-            raise HTTPException(status_code=400, detail="User already exists")
-        # Создаём пользователя
-        row = await conn.fetchrow(
-            "INSERT INTO users(username, password) VALUES($1,$2) RETURNING id",
-            username, password
-        )
-        return {"user_id": str(row["id"])}
+        return JSONResponse({"error": "username or password missing"}, status_code=400)
+
+    conn = await get_conn()
+    # Проверяем, нет ли уже пользователя
+    exists = await conn.fetchrow("SELECT id FROM users WHERE username=$1", username)
+    if exists:
+        return JSONResponse({"error": "username already exists"}, status_code=400)
+
+    row = await conn.fetchrow(
+        "INSERT INTO users(username, password) VALUES($1, $2) RETURNING id",
+        username, password
+    )
+    return {"id": row["id"]}
+
 
 @app.post("/login")
-async def login_user(data: dict):
+async def login_user(req: Request):
+    data = await req.json()
     username = data.get("username")
     password = data.get("password")
     if not username or not password:
-        raise HTTPException(status_code=400, detail="username and password required")
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE username=$1 AND password=$2", username, password)
-        if not user:
-            raise HTTPException(status_code=400, detail="Invalid credentials")
-        return {"user_id": str(user["id"])}
+        return JSONResponse({"error": "username or password missing"}, status_code=400)
 
-# --------------------------
+    conn = await get_conn()
+    row = await conn.fetchrow("SELECT id, password FROM users WHERE username=$1", username)
+    if not row or row["password"] != password:
+        return JSONResponse({"error": "invalid credentials"}, status_code=400)
+
+    return {"id": row["id"]}
+
+
+# -------------------------
 # WebSocket
-# --------------------------
-connected_clients = set()  # {(websocket, username, user_id)}
+# -------------------------
+connected_clients = set()  # {(websocket, user_id, username)}
+
+async def send_history(ws, user_id):
+    conn = await get_conn()
+    rows = await conn.fetch("""
+        SELECT messages.text, users.username, messages.created_at
+        FROM messages
+        JOIN users ON messages.user_id = users.id
+        ORDER BY messages.id ASC
+    """)
+    for r in rows:
+        msg_text = f"{r['username']}: {r['text']}"
+        await ws.send_text(msg_text)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    conn = await get_conn()
     try:
+        # Ждем идентификацию от клиента
         auth_raw = await websocket.receive_text()
         auth = json.loads(auth_raw)
-        username = auth.get("username")
         user_id = auth.get("user_id")
-        if not username or not user_id:
+        username = auth.get("username")
+        if not user_id or not username:
             await websocket.close()
             return
 
-        # Проверяем, что user_id существует в БД
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", int(user_id))
-            if not user:
-                await websocket.close()
-                return
-
-        connected_clients.add((websocket, username, user_id))
-        print(f"User connected: {username} ({user_id})")
+        connected_clients.add((websocket, user_id, username))
 
         # Отправляем историю сообщений
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT m.text, u.username FROM messages m JOIN users u ON m.user_id = u.id ORDER BY m.created_at ASC"
-            )
-            for row in rows:
-                await websocket.send_text(json.dumps({"type": "message", "user": row["username"], "text": row["text"]}))
+        await send_history(websocket, user_id)
 
-        # Основной цикл
         while True:
-            msg = await websocket.receive_text()
-            if msg.startswith("__PING__"):
-                # Отправляем Ping всем остальным
-                for ws, uname, uid in connected_clients:
-                    if ws != websocket:
-                        await ws.send_text(json.dumps({"type": "ping", "user": username}))
+            msg_raw = await websocket.recv()
+            try:
+                data = json.loads(msg_raw)
+            except:
                 continue
 
-            # Сохраняем сообщение в БД
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO messages(user_id, text, created_at) VALUES($1, $2, $3)",
-                    int(user_id), msg, int(time.time())
-                )
+            # Обработка Ping
+            if data.get("ping"):
+                for ws, uid, uname in connected_clients:
+                    if ws != websocket:
+                        await ws.send_text(json.dumps({"ping": True, "user_id": user_id}))
+                continue
 
-            # Отправляем всем подключённым
-            for ws, uname, uid in connected_clients:
-                await ws.send_text(json.dumps({"type": "message", "user": username, "text": msg}))
+            # Обычное сообщение
+            text = data.get("text")
+            if not text:
+                continue
+
+            # Сохраняем в базе
+            created_at = int(datetime.utcnow().timestamp())
+            await conn.execute(
+                "INSERT INTO messages(user_id, text, created_at) VALUES($1,$2,$3)",
+                user_id, text, created_at
+            )
+
+            # Отправляем всем подключенным клиентам
+            full_msg = f"{username}: {text}"
+            for ws, uid, uname in connected_clients:
+                await ws.send_text(full_msg)
 
     except WebSocketDisconnect:
-        connected_clients.remove((websocket, username, user_id))
-        print(f"User disconnected: {username}")
-        for ws, uname, uid in connected_clients:
-            await ws.send_text(json.dumps({"type": "system", "text": f"{username} disconnected"}))
+        connected_clients.remove((websocket, user_id, username))
+        # Оповещаем всех об отключении
+        for ws, uid, uname in connected_clients:
+            await ws.send_text(f"*** {username} отключился ***")
