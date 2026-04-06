@@ -1,11 +1,16 @@
+# server.py
+import os
 import json
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import asyncpg
 
 app = FastAPI()
 
+# -------------------------
+# CORS
+# -------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,12 +20,22 @@ app.add_middleware(
 )
 
 # -------------------------
-# PostgreSQL
+# DATABASE_URL
 # -------------------------
-DATABASE_URL = "postgres://..."  # твой DATABASE_URL
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан! Проверь переменные окружения на Railway")
 
+# -------------------------
+# Подключение к базе
+# -------------------------
 async def get_conn():
-    return await asyncpg.connect(DATABASE_URL)
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"[ERROR] Не удалось подключиться к базе: {e}")
+        raise
 
 # -------------------------
 # Подключенные клиенты
@@ -90,9 +105,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         await client_ws.send(json.dumps(msg))
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"[WebSocket ERROR] {e}")
     finally:
-        # Убираем пользователя из онлайн и соединений
         if (websocket, user_id, username) in connected_clients:
             connected_clients.discard((websocket, user_id, username))
         if user_id in online_users:
@@ -102,17 +116,18 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"User disconnected: {username} ({user_id})")
 
 # -------------------------
-# HTTP для регистрации/логина
+# HTTP: регистрация и логин
 # -------------------------
-from fastapi import Request
-
 @app.post("/register")
 async def register(request: Request):
-    data = await request.json()
-    username = data.get("username")
-    password = data.get("password")
     conn = await get_conn()
     try:
+        data = await request.json()
+        username = data.get("username")
+        password = data.get("password")
+        if not username or not password:
+            return {"success": False, "message": "Имя и пароль обязательны"}
+
         await conn.execute("INSERT INTO users(username, password) VALUES($1, $2)", username, password)
         return {"success": True}
     except Exception as e:
@@ -122,14 +137,20 @@ async def register(request: Request):
 
 @app.post("/login")
 async def login(request: Request):
-    data = await request.json()
-    username = data.get("username")
-    password = data.get("password")
     conn = await get_conn()
     try:
+        data = await request.json()
+        username = data.get("username")
+        password = data.get("password")
+        if not username or not password:
+            return {"success": False, "message": "Имя и пароль обязательны"}
+
         user = await conn.fetchrow("SELECT id, username FROM users WHERE username=$1 AND password=$2", username, password)
         if not user:
             return {"success": False, "message": "Неверный логин или пароль"}
+
         return {"success": True, "user_id": user["id"], "username": user["username"]}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
     finally:
         await conn.close()
