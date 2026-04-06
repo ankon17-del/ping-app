@@ -67,6 +67,7 @@ async def websocket_endpoint(websocket: WebSocket):
     username = None
 
     try:
+        # Авторизация клиента
         auth_raw = await websocket.receive_text()
         auth = json.loads(auth_raw)
         user_id = auth.get("user_id")
@@ -86,23 +87,41 @@ async def websocket_endpoint(websocket: WebSocket):
         await broadcast_online()
         print(f"User connected: {username} ({user_id})")
 
+        # Отправляем историю сообщений после подключения
+        rows = await conn.fetch(
+            "SELECT users.username, messages.text, messages.created_at "
+            "FROM messages JOIN users ON messages.user_id = users.id "
+            "ORDER BY messages.id ASC"
+        )
+        for row in rows:
+            await websocket.send(f"{row['username']}: {row['text']}")
+
+        # Основной цикл
         while True:
-            msg_raw = await websocket.receive_text()
-            msg = json.loads(msg_raw)
-            # Сохраняем текстовые сообщения
-            if "text" in msg:
-                await conn.execute(
-                    "INSERT INTO messages(user_id, text, created_at) VALUES($1, $2, EXTRACT(EPOCH FROM NOW())::int)",
-                    user_id, msg["text"]
-                )
-                # Рассылаем всем обычное сообщение
-                for client_ws, _, _ in connected_clients:
-                    await client_ws.send(msg["text"])
-            # Обработка ping
-            elif msg.get("ping"):
-                for client_ws, client_uid, _ in connected_clients:
-                    if client_uid != user_id:
-                        await client_ws.send(json.dumps(msg))
+            try:
+                msg_raw = await websocket.receive_text()
+                msg = json.loads(msg_raw)
+                # -------------------------
+                # Текстовое сообщение
+                # -------------------------
+                if "text" in msg:
+                    await conn.execute(
+                        "INSERT INTO messages(user_id, text, created_at) "
+                        "VALUES($1, $2, EXTRACT(EPOCH FROM NOW())::int)",
+                        user_id, msg["text"]
+                    )
+                    # Рассылаем всем
+                    for client_ws, _, _ in connected_clients:
+                        await client_ws.send(f"{username}: {msg['text']}")
+                # -------------------------
+                # Ping
+                # -------------------------
+                elif msg.get("ping"):
+                    for client_ws, client_uid, _ in connected_clients:
+                        if client_uid != user_id:
+                            await client_ws.send(json.dumps(msg))
+            except Exception as e:
+                print(f"[WebSocket ERROR] {e}")
 
     except Exception as e:
         print(f"[WebSocket ERROR] {e}")
@@ -129,7 +148,9 @@ async def register(request: Request):
             return {"success": False, "message": "Имя и пароль обязательны"}
 
         await conn.execute("INSERT INTO users(username, password) VALUES($1, $2)", username, password)
-        return {"success": True}
+        # Получаем ID нового пользователя
+        user = await conn.fetchrow("SELECT id FROM users WHERE username=$1", username)
+        return {"success": True, "user_id": user["id"]}
     except Exception as e:
         return {"success": False, "message": str(e)}
     finally:
