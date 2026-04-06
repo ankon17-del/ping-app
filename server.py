@@ -6,26 +6,25 @@ import uuid
 app = FastAPI()
 
 connected_clients = set()  # {(websocket, username, user_id)}
-message_history = []  # список последних 100 сообщений
+message_history = []  # последние 100 сообщений
 
-MAX_HISTORY = 100  # ограничение истории сообщений
+MAX_HISTORY = 100  # ограничение истории
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     try:
-        # Получаем username от клиента
         username = await websocket.receive_text()
-        user_id = str(uuid.uuid4())  # временно генерируем user_id
+        user_id = str(uuid.uuid4())  # временно уникальный id
         connected_clients.add((websocket, username, user_id))
         print(f"New client connected: {username} ({user_id})")
 
-        # Отправляем историю сообщений новому клиенту
+        # Отправка истории новому клиенту
         for msg in message_history:
             await websocket.send_text(json.dumps(msg))
         
-        # Уведомление о входе
+        # Системное уведомление о подключении
         system_msg = {
             "type": "system",
             "text": f"{username} подключился",
@@ -36,7 +35,6 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             raw_msg = await websocket.receive_text()
             
-            # Обработка ping
             if raw_msg.startswith("__PING__"):
                 ping_msg = {
                     "type": "ping",
@@ -63,7 +61,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         connected_clients.remove((websocket, username, user_id))
         print(f"Client {username} disconnected")
-        # Сообщаем остальным
+
         disc_msg = {
             "type": "system",
             "text": f"{username} отключился",
@@ -72,7 +70,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await broadcast(disc_msg)
 
 # --------------------------
-# Вспомогательная функция для рассылки
+# Вспомогательная функция рассылки
 # --------------------------
 async def broadcast(message: dict, exclude=[]):
     to_remove = []
