@@ -1,126 +1,90 @@
-# server.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict, List
+import asyncio
+import json
+import uuid
 
 app = FastAPI()
 
-# websocket -> username
-connected_clients: Dict[WebSocket, str] = {}
+connected_clients = set()  # {(websocket, username, user_id)}
+message_history = []  # список последних 100 сообщений
 
-# История сообщений
-message_history: List[str] = []
-MAX_HISTORY = 100
-
-
-def sanitize_username(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "Anonymous"
-
-    # Убираем слишком длинные имена
-    name = name[:20]
-
-    # Запрещаем служебные названия
-    if name.startswith("__"):
-        name = "Anonymous"
-
-    return name
-
-
-def make_unique_username(name: str) -> str:
-    existing_names = set(connected_clients.values())
-
-    if name not in existing_names:
-        return name
-
-    counter = 2
-    while f"{name}_{counter}" in existing_names:
-        counter += 1
-
-    return f"{name}_{counter}"
-
-
-def add_to_history(msg: str):
-    global message_history
-    message_history.append(msg)
-    message_history = message_history[-MAX_HISTORY:]
-
-
-async def safe_send(ws: WebSocket, msg: str) -> bool:
-    try:
-        await ws.send_text(msg)
-        return True
-    except Exception:
-        return False
-
-
-async def broadcast(msg: str, exclude_ws: WebSocket = None):
-    dead_clients = []
-
-    for ws in list(connected_clients.keys()):
-        if exclude_ws and ws == exclude_ws:
-            continue
-
-        ok = await safe_send(ws, msg)
-        if not ok:
-            dead_clients.append(ws)
-
-    for dead_ws in dead_clients:
-        username = connected_clients.pop(dead_ws, None)
-        if username:
-            print(f"Removed dead client: {username}")
-
+MAX_HISTORY = 100  # ограничение истории сообщений
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    username = "Anonymous"
-
+    
     try:
-        # Первое сообщение = имя пользователя
-        raw_name = await websocket.receive_text()
-        username = sanitize_username(raw_name)
-        username = make_unique_username(username)
+        # Получаем username от клиента
+        username = await websocket.receive_text()
+        user_id = str(uuid.uuid4())  # временно генерируем user_id
+        connected_clients.add((websocket, username, user_id))
+        print(f"New client connected: {username} ({user_id})")
 
-        connected_clients[websocket] = username
-        print(f"New client connected: {username}")
-
-        # Отправляем историю новому клиенту
+        # Отправляем историю сообщений новому клиенту
         for msg in message_history:
-            await safe_send(websocket, msg)
-
-        # Сообщаем остальным, что пользователь вошёл
-        join_msg = f"*** {username} подключился ***"
-        add_to_history(join_msg)
-        await broadcast(join_msg, exclude_ws=websocket)
+            await websocket.send_text(json.dumps(msg))
+        
+        # Уведомление о входе
+        system_msg = {
+            "type": "system",
+            "text": f"{username} подключился",
+            "user": username
+        }
+        await broadcast(system_msg, exclude=[websocket])
 
         while True:
-            msg = await websocket.receive_text()
-            msg = msg.strip()
-
-            if not msg:
-                continue
-
-            # Обработка Ping
-            if msg == "__PING__":
-                await broadcast(f"__PING__::{username}", exclude_ws=websocket)
+            raw_msg = await websocket.receive_text()
+            
+            # Обработка ping
+            if raw_msg.startswith("__PING__"):
+                ping_msg = {
+                    "type": "ping",
+                    "user": username,
+                    "text": "Ping!"
+                }
+                await broadcast(ping_msg, exclude=[websocket])
                 continue
 
             # Обычное сообщение
-            full_msg = f"{username}: {msg}"
-            add_to_history(full_msg)
+            chat_msg = {
+                "type": "message",
+                "user": username,
+                "user_id": user_id,
+                "text": raw_msg
+            }
 
-            await broadcast(full_msg)
+            message_history.append(chat_msg)
+            if len(message_history) > MAX_HISTORY:
+                message_history.pop(0)
 
+            await broadcast(chat_msg)
+                
     except WebSocketDisconnect:
+        connected_clients.remove((websocket, username, user_id))
         print(f"Client {username} disconnected")
+        # Сообщаем остальным
+        disc_msg = {
+            "type": "system",
+            "text": f"{username} отключился",
+            "user": username
+        }
+        await broadcast(disc_msg)
 
-    except Exception as e:
-        print(f"Error with client {username}: {e}")
-
-    finally:
-        if websocket in connected_clients:
-            disconnected_user = connected_clients.pop(websocket)
-            leave_msg = f"__DISCONNECT__::{disconnected_user}"
-            await broadcast(leave_msg)
-            print(f"Cleaned up client: {disconnected_user}")
+# --------------------------
+# Вспомогательная функция для рассылки
+# --------------------------
+async def broadcast(message: dict, exclude=[]):
+    to_remove = []
+    for ws, _, _ in connected_clients:
+        if ws in exclude:
+            continue
+        try:
+            await ws.send_text(json.dumps(message))
+        except:
+            to_remove.append(ws)
+    # удаляем нерабочие соединения
+    for ws in to_remove:
+        for c in connected_clients.copy():
+            if c[0] == ws:
+                connected_clients.remove(c)
