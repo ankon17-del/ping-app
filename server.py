@@ -156,15 +156,27 @@ async def websocket_endpoint(websocket: WebSocket):
         # Основной цикл
         while True:
             msg_raw = await websocket.receive_text()
-            data = json.loads(msg_raw)
+            try:
+                data = json.loads(msg_raw)
+                if not isinstance(data, dict):
+                    continue  # игнорируем некорректные сообщения
+            except:
+                continue
 
-            if data.get("ping"):
+            # ----------------
+            # Обработка ping
+            # ----------------
+            if data.get("type") == "ping":
                 message_to_send = json.dumps({
                     "type": "ping",
                     "user_id": user_id,
                     "username": username
                 })
-            else:
+
+            # ----------------
+            # Обычное сообщение
+            # ----------------
+            elif data.get("type") == "message":
                 text = data.get("text", "").strip()
                 if not text:
                     continue
@@ -177,7 +189,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     "username": username,
                     "text": text
                 })
+            else:
+                continue  # неизвестный type
 
+            # ----------------
+            # Рассылка всем
+            # ----------------
             dead_clients = []
             for client_ws, _, _ in connected_clients:
                 try:
