@@ -166,61 +166,61 @@ async def websocket_endpoint(websocket: WebSocket):
         # -------------------------
         # Основной цикл чата
         # -------------------------
-      while True:
-    msg_raw = await websocket.receive_text()
-    data = json.loads(msg_raw)
+        while True:
+            msg_raw = await websocket.receive_text()
+            data = json.loads(msg_raw)
 
-    # -------------------------
-    # Ping-событие
-    # -------------------------
-    if data.get("ping") is True:
-        ping_event = json.dumps({
-            "ping": True,
-            "user_id": user_id,
-            "username": username
-        })
+            # -------------------------
+            # Ping-событие
+            # -------------------------
+            if data.get("ping") is True:
+                ping_event = json.dumps({
+                    "ping": True,
+                    "user_id": user_id,
+                    "username": username
+                })
 
-        dead_clients = []
+                dead_clients = []
 
-        for client_ws, client_user_id, client_username in connected_clients:
-            try:
-                await client_ws.send_text(ping_event)
-            except Exception:
-                dead_clients.append((client_ws, client_user_id, client_username))
+                for client_ws, client_user_id, client_username in connected_clients:
+                    try:
+                        await client_ws.send_text(ping_event)
+                    except Exception:
+                        dead_clients.append((client_ws, client_user_id, client_username))
 
-        for dead in dead_clients:
-            connected_clients.discard(dead)
+                for dead in dead_clients:
+                    connected_clients.discard(dead)
 
-        continue
+                continue
 
-    # -------------------------
-    # Обычное сообщение
-    # -------------------------
-    text = data.get("text", "").strip()
-    if not text:
-        continue
+            # -------------------------
+            # Обычное сообщение
+            # -------------------------
+            text = data.get("text", "").strip()
+            if not text:
+                continue
 
-    # Сохраняем сообщение в БД
-    await conn.execute(
-        "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
-        user_id,
-        text,
-        int(time.time())
-    )
+            # Сохраняем сообщение в БД
+            await conn.execute(
+                "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
+                user_id,
+                text,
+                int(time.time())
+            )
 
-    # Формируем сообщение для рассылки
-    message_to_send = f"{username}: {text}"
+            # Формируем сообщение для рассылки
+            message_to_send = f"{username}: {text}"
 
-    dead_clients = []
+            dead_clients = []
 
-    for client_ws, client_user_id, client_username in connected_clients:
-        try:
-            await client_ws.send_text(message_to_send)
-        except Exception:
-            dead_clients.append((client_ws, client_user_id, client_username))
+            for client_ws, client_user_id, client_username in connected_clients:
+                try:
+                    await client_ws.send_text(message_to_send)
+                except Exception:
+                    dead_clients.append((client_ws, client_user_id, client_username))
 
-    for dead in dead_clients:
-        connected_clients.discard(dead)
+            for dead in dead_clients:
+                connected_clients.discard(dead)
 
     except Exception as e:
         print("WebSocket error:", e)
