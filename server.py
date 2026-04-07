@@ -178,14 +178,19 @@ async def websocket_endpoint(websocket: WebSocket):
         # Отправка истории сообщений
         # -------------------------
         rows = await conn.fetch("""
-            SELECT messages.text, users.username
+            SELECT messages.text, messages.created_at, users.username
             FROM messages
             JOIN users ON messages.user_id = users.id
             ORDER BY messages.id ASC
             LIMIT 100
         """)
         for row in rows:
-            await websocket.send_text(f"{row['username']}: {row['text']}")
+            await websocket.send_text(json.dumps({
+                "type": "chat_message",
+                "username": row["username"],
+                "text": row["text"],
+                "created_at": row["created_at"]
+            }))
 
         # -------------------------
         # Обновление онлайн/офлайн всех клиентов
@@ -205,7 +210,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if data.get("ping"):
                 dead_clients = []
                 for ws, uid, uname in connected_clients:
-                    if uid != user_id:  # отправитель не получает
+                    if uid != user_id:
                         try:
                             await ws.send_text(json.dumps({
                                 "type": "ping",
@@ -216,7 +221,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             dead_clients.append((ws, uid, uname))
                 for dead in dead_clients:
                     connected_clients.discard(dead)
-                continue  # не добавляем в чат отправителю
+                continue
 
             # -------------------------
             # Обычное сообщение
@@ -225,14 +230,21 @@ async def websocket_endpoint(websocket: WebSocket):
             if not text:
                 continue
 
+            created_at = int(time.time())
+
             await conn.execute(
                 "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
                 user_id,
                 text,
-                int(time.time())
+                created_at
             )
 
-            message_to_send = f"{username}: {text}"
+            message_to_send = json.dumps({
+                "type": "chat_message",
+                "username": username,
+                "text": text,
+                "created_at": created_at
+            })
 
             dead_clients = []
             for ws, _, _ in connected_clients:
@@ -250,5 +262,5 @@ async def websocket_endpoint(websocket: WebSocket):
         if user_id and username:
             connected_clients.discard((websocket, user_id, username))
             print(f"User disconnected: {username} ({user_id})")
-            await broadcast_online_status()  # обновляем статус при выходе
+            await broadcast_online_status()
         await conn.close()
