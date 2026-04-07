@@ -19,7 +19,7 @@ app.add_middleware(
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-connected_clients = set()  # set of tuples (websocket, user_id, username)
+connected_clients = set()  # (websocket, user_id, username)
 
 
 # -------------------------
@@ -61,6 +61,7 @@ async def register(data: RegisterData):
             "SELECT * FROM users WHERE username=$1",
             data.username
         )
+
         if existing:
             return {"success": False, "message": "Username already exists"}
 
@@ -69,6 +70,7 @@ async def register(data: RegisterData):
             data.username,
             data.password
         )
+
         return {"success": True, "message": "Registered successfully"}
 
     except Exception as e:
@@ -110,24 +112,35 @@ async def login(data: LoginData):
 
 
 # -------------------------
-# Рассылка онлайн пользователей
+# Получение списка всех пользователей
 # -------------------------
-async def broadcast_online_users():
-    online_usernames = [u for _, _, u in connected_clients]
-    data = json.dumps({"type": "online", "users": online_usernames})
-    dead_clients = []
-    for client_ws, _, _ in connected_clients:
-        try:
-            await client_ws.send_text(data)
-        except:
-            dead_clients.append((client_ws, _, _))
-    for dead in dead_clients:
-        connected_clients.discard(dead)
+@app.get("/users")
+async def get_users():
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch("SELECT id, username FROM users ORDER BY username ASC")
+        users = [{"user_id": row["id"], "username": row["username"]} for row in rows]
+        return {"users": users}
+    finally:
+        await conn.close()
 
 
 # -------------------------
 # WebSocket чат
 # -------------------------
+async def broadcast_online():
+    online_usernames = [username for _, _, username in connected_clients]
+    data = json.dumps({"type": "online_update", "online": online_usernames})
+    dead_clients = []
+    for ws, _, _ in connected_clients:
+        try:
+            await ws.send_text(data)
+        except:
+            dead_clients.append((ws, _, _))
+    for dead in dead_clients:
+        connected_clients.discard(dead)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -155,15 +168,13 @@ async def websocket_endpoint(websocket: WebSocket):
             "SELECT id FROM users WHERE id=$1",
             user_id
         )
+
         if not user:
             await websocket.close()
             return
 
         connected_clients.add((websocket, user_id, username))
         print(f"User connected: {username} ({user_id})")
-
-        # Обновляем онлайн у всех
-        await broadcast_online_users()
 
         # -------------------------
         # Отправляем историю сообщений
@@ -175,8 +186,14 @@ async def websocket_endpoint(websocket: WebSocket):
             ORDER BY messages.id ASC
             LIMIT 100
         """)
+
         for row in rows:
             await websocket.send_text(f"{row['username']}: {row['text']}")
+
+        # -------------------------
+        # Обновляем список онлайн для всех
+        # -------------------------
+        await broadcast_online()
 
         # -------------------------
         # Основной цикл чата
@@ -185,28 +202,39 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
 
-            # -------------------------
-            # Ping
-            # -------------------------
+            # Обработка пинга
             if data.get("ping"):
+                # Отправляем пинг только другим клиентам
                 message_to_send = json.dumps({
                     "type": "ping",
                     "user_id": user_id,
                     "username": username
                 })
-            else:
-                # Обычное сообщение
-                text = data.get("text", "").strip()
-                if not text:
-                    continue
+                dead_clients = []
+                for client_ws, client_user_id, _ in connected_clients:
+                    if client_user_id != user_id:
+                        try:
+                            await client_ws.send_text(message_to_send)
+                        except:
+                            dead_clients.append((client_ws, client_user_id, username))
+                for dead in dead_clients:
+                    connected_clients.discard(dead)
+                continue
 
-                await conn.execute(
-                    "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
-                    user_id,
-                    text,
-                    int(time.time())
-                )
-                message_to_send = f"{username}: {text}"
+            # Обычное сообщение
+            text = data.get("text", "").strip()
+            if not text:
+                continue
+
+            # Сохраняем сообщение в БД
+            await conn.execute(
+                "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
+                user_id,
+                text,
+                int(time.time())
+            )
+
+            message_to_send = f"{username}: {text}"
 
             dead_clients = []
             for client_ws, _, _ in connected_clients:
@@ -214,7 +242,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     await client_ws.send_text(message_to_send)
                 except:
                     dead_clients.append((client_ws, _, _))
-
             for dead in dead_clients:
                 connected_clients.discard(dead)
 
@@ -225,5 +252,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if user_id and username:
             connected_clients.discard((websocket, user_id, username))
             print(f"User disconnected: {username} ({user_id})")
-            await broadcast_online_users()
+            await broadcast_online()
+
         await conn.close()
