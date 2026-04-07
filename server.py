@@ -59,7 +59,8 @@ async def register(data: RegisterData):
     conn = await get_conn()
     try:
         existing = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1", data.username
+            "SELECT * FROM users WHERE username=$1",
+            data.username
         )
         if existing:
             return {"success": False, "message": "Username already exists"}
@@ -134,10 +135,30 @@ async def broadcast_online_status():
                 await ws.send_text(payload)
             except Exception:
                 dead_clients.append((ws, _, _))
+
         for dead in dead_clients:
             connected_clients.discard(dead)
+
     finally:
         await conn.close()
+
+
+async def broadcast_system_message(text: str):
+    payload = json.dumps({
+        "type": "system_message",
+        "text": text,
+        "created_at": int(time.time())
+    })
+
+    dead_clients = []
+    for ws, uid, uname in connected_clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead_clients.append((ws, uid, uname))
+
+    for dead in dead_clients:
+        connected_clients.discard(dead)
 
 
 # -------------------------
@@ -173,6 +194,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
         connected_clients.add((websocket, user_id, username))
         print(f"User connected: {username} ({user_id})")
+
+        # Системное сообщение о входе
+        await broadcast_system_message(f"{username} вошёл в чат")
 
         # -------------------------
         # Отправка истории сообщений
@@ -219,8 +243,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             }))
                         except Exception:
                             dead_clients.append((ws, uid, uname))
+
                 for dead in dead_clients:
                     connected_clients.discard(dead)
+
                 continue
 
             # -------------------------
@@ -247,11 +273,12 @@ async def websocket_endpoint(websocket: WebSocket):
             })
 
             dead_clients = []
-            for ws, _, _ in connected_clients:
+            for ws, uid, uname in connected_clients:
                 try:
                     await ws.send_text(message_to_send)
                 except Exception:
-                    dead_clients.append((ws, _, _))
+                    dead_clients.append((ws, uid, uname))
+
             for dead in dead_clients:
                 connected_clients.discard(dead)
 
@@ -262,5 +289,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if user_id and username:
             connected_clients.discard((websocket, user_id, username))
             print(f"User disconnected: {username} ({user_id})")
+
+            # Системное сообщение о выходе
+            await broadcast_system_message(f"{username} вышел из чата")
+
             await broadcast_online_status()
+
         await conn.close()
