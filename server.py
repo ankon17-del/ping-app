@@ -8,7 +8,9 @@ import time
 
 app = FastAPI()
 
-# Разрешаем подключения
+# -------------------------
+# CORS
+# -------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,12 +20,11 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 connected_clients = set()  # (websocket, user_id, username)
 
 
 # -------------------------
-# Модели запросов
+# Модели
 # -------------------------
 class RegisterData(BaseModel):
     username: str
@@ -58,19 +59,16 @@ async def register(data: RegisterData):
     conn = await get_conn()
     try:
         existing = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1",
-            data.username
+            "SELECT * FROM users WHERE username=$1", data.username
         )
-
         if existing:
             return {"success": False, "message": "Username already exists"}
 
         await conn.execute(
             "INSERT INTO users (username, password) VALUES ($1, $2)",
             data.username,
-            data.password
+            data.password,
         )
-
         return {"success": True, "message": "Registered successfully"}
 
     except Exception as e:
@@ -91,14 +89,13 @@ async def login(data: LoginData):
         user = await conn.fetchrow(
             "SELECT * FROM users WHERE username=$1 AND password=$2",
             data.username,
-            data.password
+            data.password,
         )
-
         if user:
             return {
                 "success": True,
                 "user_id": user["id"],
-                "username": user["username"]
+                "username": user["username"],
             }
         else:
             return {"success": False, "message": "Invalid username or password"}
@@ -112,15 +109,33 @@ async def login(data: LoginData):
 
 
 # -------------------------
-# Получение списка всех пользователей
+# Вспомогательные функции
 # -------------------------
-@app.get("/users")
-async def get_users():
+async def broadcast_online_status():
+    """Отправляем всем клиентам обновленные списки онлайн/офлайн пользователей"""
     conn = await get_conn()
     try:
         rows = await conn.fetch("SELECT id, username FROM users ORDER BY username ASC")
-        users = [{"user_id": row["id"], "username": row["username"]} for row in rows]
-        return {"users": users}
+        all_users = [{"user_id": r["id"], "username": r["username"]} for r in rows]
+
+        online_ids = [uid for _, uid, _ in connected_clients]
+        offline_users = [u for u in all_users if u["user_id"] not in online_ids]
+        online_users = [u for u in all_users if u["user_id"] in online_ids]
+
+        payload = json.dumps({
+            "type": "online_status",
+            "online": online_users,
+            "offline": offline_users
+        })
+
+        dead_clients = []
+        for ws, _, _ in connected_clients:
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead_clients.append((ws, _, _))
+        for dead in dead_clients:
+            connected_clients.discard(dead)
     finally:
         await conn.close()
 
@@ -128,19 +143,6 @@ async def get_users():
 # -------------------------
 # WebSocket чат
 # -------------------------
-async def broadcast_online():
-    online_usernames = [username for _, _, username in connected_clients]
-    data = json.dumps({"type": "online_update", "online": online_usernames})
-    dead_clients = []
-    for ws, _, _ in connected_clients:
-        try:
-            await ws.send_text(data)
-        except:
-            dead_clients.append((ws, _, _))
-    for dead in dead_clients:
-        connected_clients.discard(dead)
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -163,12 +165,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        # Проверяем, что пользователь реально существует
-        user = await conn.fetchrow(
-            "SELECT id FROM users WHERE id=$1",
-            user_id
-        )
-
+        # Проверяем пользователя в БД
+        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
         if not user:
             await websocket.close()
             return
@@ -177,7 +175,7 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"User connected: {username} ({user_id})")
 
         # -------------------------
-        # Отправляем историю сообщений
+        # Отправка истории сообщений
         # -------------------------
         rows = await conn.fetch("""
             SELECT messages.text, users.username
@@ -186,47 +184,47 @@ async def websocket_endpoint(websocket: WebSocket):
             ORDER BY messages.id ASC
             LIMIT 100
         """)
-
         for row in rows:
             await websocket.send_text(f"{row['username']}: {row['text']}")
 
         # -------------------------
-        # Обновляем список онлайн для всех
+        # Обновление онлайн/офлайн всех клиентов
         # -------------------------
-        await broadcast_online()
+        await broadcast_online_status()
 
         # -------------------------
-        # Основной цикл чата
+        # Основной цикл
         # -------------------------
         while True:
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
 
-            # Обработка пинга
+            # -------------------------
+            # Ping
+            # -------------------------
             if data.get("ping"):
-                # Отправляем пинг только другим клиентам
-                message_to_send = json.dumps({
-                    "type": "ping",
-                    "user_id": user_id,
-                    "username": username
-                })
                 dead_clients = []
-                for client_ws, client_user_id, _ in connected_clients:
-                    if client_user_id != user_id:
+                for ws, uid, uname in connected_clients:
+                    if uid != user_id:  # отправитель не получает
                         try:
-                            await client_ws.send_text(message_to_send)
-                        except:
-                            dead_clients.append((client_ws, client_user_id, username))
+                            await ws.send_text(json.dumps({
+                                "type": "ping",
+                                "user_id": user_id,
+                                "username": username
+                            }))
+                        except Exception:
+                            dead_clients.append((ws, uid, uname))
                 for dead in dead_clients:
                     connected_clients.discard(dead)
-                continue
+                continue  # не добавляем в чат отправителю
 
+            # -------------------------
             # Обычное сообщение
+            # -------------------------
             text = data.get("text", "").strip()
             if not text:
                 continue
 
-            # Сохраняем сообщение в БД
             await conn.execute(
                 "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
                 user_id,
@@ -237,11 +235,11 @@ async def websocket_endpoint(websocket: WebSocket):
             message_to_send = f"{username}: {text}"
 
             dead_clients = []
-            for client_ws, _, _ in connected_clients:
+            for ws, _, _ in connected_clients:
                 try:
-                    await client_ws.send_text(message_to_send)
-                except:
-                    dead_clients.append((client_ws, _, _))
+                    await ws.send_text(message_to_send)
+                except Exception:
+                    dead_clients.append((ws, _, _))
             for dead in dead_clients:
                 connected_clients.discard(dead)
 
@@ -252,6 +250,5 @@ async def websocket_endpoint(websocket: WebSocket):
         if user_id and username:
             connected_clients.discard((websocket, user_id, username))
             print(f"User disconnected: {username} ({user_id})")
-            await broadcast_online()
-
+            await broadcast_online_status()  # обновляем статус при выходе
         await conn.close()
