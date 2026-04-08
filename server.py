@@ -129,11 +129,11 @@ async def broadcast_online_status():
         })
 
         dead_clients = []
-        for ws, _, _ in connected_clients:
+        for ws, uid, uname in connected_clients:
             try:
                 await ws.send_text(payload)
             except Exception:
-                dead_clients.append((ws, _, _))
+                dead_clients.append((ws, uid, uname))
 
         for dead in dead_clients:
             connected_clients.discard(dead)
@@ -275,6 +275,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 target_ws, target_uid, target_uname = target_client
+
+                await conn.execute(
+                    """
+                    INSERT INTO private_messages (from_user_id, to_user_id, text, created_at)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    user_id,
+                    target_uid,
+                    text,
+                    created_at
+                )
 
                 private_payload = json.dumps({
                     "type": "private_message",
