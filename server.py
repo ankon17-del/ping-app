@@ -391,13 +391,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 if peer_username:
                     success = await clear_private_dialog(conn, user_id, peer_username)
 
-                    await websocket.send_text(json.dumps({
+                    requester_payload = json.dumps({
                         "type": "private_dialog_cleared",
                         "peer_username": peer_username,
                         "success": success
-                    }))
-
+                    })
+                    await websocket.send_text(requester_payload)
                     await send_unread_private_counts(websocket, conn, user_id)
+
+                    if success and peer_username != username:
+                        target_client = find_client_by_username(peer_username)
+                        if target_client:
+                            target_ws, target_uid, target_uname = target_client
+                            target_payload = json.dumps({
+                                "type": "private_dialog_cleared",
+                                "peer_username": username,
+                                "success": True
+                            })
+                            try:
+                                await target_ws.send_text(target_payload)
+                                await send_unread_private_counts(target_ws, conn, target_uid)
+                            except Exception:
+                                connected_clients.discard((target_ws, target_uid, target_uname))
                 continue
 
             if data.get("type") == "mark_private_as_read":
