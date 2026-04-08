@@ -236,6 +236,26 @@ async def delete_favorites_message(conn, current_user_id: int, message_id: int):
     return result.endswith("1")
 
 
+async def delete_private_message(conn, current_user_id: int, peer_username: str, message_id: int):
+    peer = await conn.fetchrow(
+        "SELECT id FROM users WHERE username=$1",
+        peer_username
+    )
+    if not peer:
+        return False
+
+    peer_id = peer["id"]
+
+    result = await conn.execute("""
+        DELETE FROM private_messages
+        WHERE id = $1
+          AND from_user_id = $2
+          AND to_user_id = $3
+    """, message_id, current_user_id, peer_id)
+
+    return result.endswith("1")
+
+
 # -------------------------
 # WebSocket чат
 # -------------------------
@@ -326,6 +346,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "favorites_message_deleted",
                     "message_id": message_id,
+                    "success": success
+                }))
+                continue
+
+            if data.get("type") == "delete_private_message":
+                message_id = data.get("message_id")
+                peer_username = data.get("peer_username", "").strip()
+                success = False
+
+                if message_id is not None and peer_username:
+                    try:
+                        success = await delete_private_message(
+                            conn,
+                            user_id,
+                            peer_username,
+                            int(message_id)
+                        )
+                    except Exception:
+                        success = False
+
+                await websocket.send_text(json.dumps({
+                    "type": "private_message_deleted",
+                    "message_id": message_id,
+                    "peer_username": peer_username,
                     "success": success
                 }))
                 continue
