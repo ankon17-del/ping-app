@@ -5,7 +5,9 @@ import asyncpg
 import os
 import json
 import time
-import bcrypt
+import base64
+import hashlib
+import hmac
 
 app = FastAPI()
 
@@ -23,32 +25,8 @@ app.add_middleware(
 DATABASE_URL = os.getenv("DATABASE_URL")
 connected_clients = set()  # (websocket, user_id, username)
 
-
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def looks_like_bcrypt_hash(value: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    return value.startswith("$2a$") or value.startswith("$2b$") or value.startswith("$2y$")
-
-
-def verify_password(password: str, stored_password: str) -> bool:
-    if not stored_password:
-        return False
-
-    if looks_like_bcrypt_hash(stored_password):
-        try:
-            return bcrypt.checkpw(
-                password.encode("utf-8"),
-                stored_password.encode("utf-8")
-            )
-        except Exception:
-            return False
-
-    return password == stored_password
-
+PBKDF2_ITERATIONS = 390000
+HASH_SCHEME = "pbkdf2_sha256"
 
 
 # -------------------------
@@ -72,6 +50,59 @@ async def get_conn():
 
 
 # -------------------------
+# Хеширование паролей
+# -------------------------
+def is_hashed_password(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.startswith(f"{HASH_SCHEME}$")
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ITERATIONS,
+    )
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    digest_b64 = base64.b64encode(digest).decode("ascii")
+    return f"{HASH_SCHEME}${PBKDF2_ITERATIONS}${salt_b64}${digest_b64}"
+
+
+def verify_hashed_password(password: str, stored_value: str) -> bool:
+    try:
+        scheme, iterations_str, salt_b64, digest_b64 = stored_value.split("$", 3)
+        if scheme != HASH_SCHEME:
+            return False
+
+        iterations = int(iterations_str)
+        salt = base64.b64decode(salt_b64.encode("ascii"))
+        expected_digest = base64.b64decode(digest_b64.encode("ascii"))
+
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            iterations,
+        )
+        return hmac.compare_digest(actual_digest, expected_digest)
+    except Exception:
+        return False
+
+
+def verify_password(password: str, stored_value: str) -> bool:
+    if not isinstance(stored_value, str):
+        return False
+
+    if is_hashed_password(stored_value):
+        return verify_hashed_password(password, stored_value)
+
+    return hmac.compare_digest(password, stored_value)
+
+
+# -------------------------
 # Проверка сервера
 # -------------------------
 @app.get("/")
@@ -86,24 +117,18 @@ async def root():
 async def register(data: RegisterData):
     conn = await get_conn()
     try:
-        username = data.username.strip()
-        password = data.password
-
-        if not username or not password:
-            return {"success": False, "message": "Username and password are required"}
-
         existing = await conn.fetchrow(
-            "SELECT id FROM users WHERE username=$1",
-            username
+            "SELECT * FROM users WHERE username=$1",
+            data.username
         )
         if existing:
             return {"success": False, "message": "Username already exists"}
 
-        password_hash = hash_password(password)
+        password_hash = hash_password(data.password)
 
         await conn.execute(
             "INSERT INTO users (username, password) VALUES ($1, $2)",
-            username,
+            data.username,
             password_hash,
         )
         return {"success": True, "message": "Registered successfully"}
@@ -123,35 +148,25 @@ async def register(data: RegisterData):
 async def login(data: LoginData):
     conn = await get_conn()
     try:
-        username = data.username.strip()
-        password = data.password
-
-        if not username or not password:
-            return {"success": False, "message": "Invalid username or password"}
-
         user = await conn.fetchrow(
             "SELECT * FROM users WHERE username=$1",
-            username,
+            data.username,
         )
 
         if not user:
             return {"success": False, "message": "Invalid username or password"}
 
         stored_password = user["password"]
-
-        if not verify_password(password, stored_password):
+        if not verify_password(data.password, stored_password):
             return {"success": False, "message": "Invalid username or password"}
 
-        if not looks_like_bcrypt_hash(stored_password):
-            try:
-                upgraded_hash = hash_password(password)
-                await conn.execute(
-                    "UPDATE users SET password=$1 WHERE id=$2",
-                    upgraded_hash,
-                    user["id"]
-                )
-            except Exception as migrate_error:
-                print("PASSWORD MIGRATION ERROR:", migrate_error)
+        if not is_hashed_password(stored_password):
+            upgraded_hash = hash_password(data.password)
+            await conn.execute(
+                "UPDATE users SET password=$1 WHERE id=$2",
+                upgraded_hash,
+                user["id"],
+            )
 
         return {
             "success": True,
