@@ -201,6 +201,31 @@ async def mark_private_messages_as_read(conn, current_user_id: int, from_usernam
     """, current_user_id, sender["id"])
 
 
+async def clear_private_dialog(conn, current_user_id: int, peer_username: str):
+    peer = await conn.fetchrow(
+        "SELECT id, username FROM users WHERE username=$1",
+        peer_username
+    )
+    if not peer:
+        return False
+
+    peer_id = peer["id"]
+
+    if peer_id == current_user_id:
+        await conn.execute("""
+            DELETE FROM private_messages
+            WHERE from_user_id = $1 AND to_user_id = $1
+        """, current_user_id)
+        return True
+
+    await conn.execute("""
+        DELETE FROM private_messages
+        WHERE (from_user_id = $1 AND to_user_id = $2)
+           OR (from_user_id = $2 AND to_user_id = $1)
+    """, current_user_id, peer_id)
+    return True
+
+
 # -------------------------
 # WebSocket чат
 # -------------------------
@@ -292,6 +317,23 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
+
+            # -------------------------
+            # Очистить диалог
+            # -------------------------
+            if data.get("type") == "clear_private_dialog":
+                peer_username = data.get("peer_username", "").strip()
+                if peer_username:
+                    success = await clear_private_dialog(conn, user_id, peer_username)
+
+                    await websocket.send_text(json.dumps({
+                        "type": "private_dialog_cleared",
+                        "peer_username": peer_username,
+                        "success": success
+                    }))
+
+                    await send_unread_private_counts(websocket, conn, user_id)
+                continue
 
             # -------------------------
             # Отметить ЛС как прочитанные
