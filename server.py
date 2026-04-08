@@ -243,10 +243,10 @@ async def websocket_endpoint(websocket: WebSocket):
             SELECT messages.text, messages.created_at, users.username
             FROM messages
             JOIN users ON messages.user_id = users.id
-            ORDER BY messages.id ASC
-            LIMIT 100
+            ORDER BY messages.id DESC
+            LIMIT 1000
         """)
-        for row in rows:
+        for row in reversed(rows):
             await websocket.send_text(json.dumps({
                 "type": "chat_message",
                 "username": row["username"],
@@ -268,7 +268,6 @@ async def websocket_endpoint(websocket: WebSocket):
             JOIN users receiver ON pm.to_user_id = receiver.id
             WHERE pm.from_user_id = $1 OR pm.to_user_id = $1
             ORDER BY pm.id ASC
-            LIMIT 200
         """, user_id)
 
         for row in private_rows:
@@ -351,15 +350,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 target_ws, target_uid, target_uname = target_client
 
+                is_self_message = (target_uid == user_id)
+
                 await conn.execute(
                     """
                     INSERT INTO private_messages (from_user_id, to_user_id, text, created_at, is_read)
-                    VALUES ($1, $2, $3, $4, FALSE)
+                    VALUES ($1, $2, $3, $4, $5)
                     """,
                     user_id,
                     target_uid,
                     text,
-                    created_at
+                    created_at,
+                    True if is_self_message else False
                 )
 
                 private_payload = json.dumps({
@@ -372,15 +374,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 dead_clients = []
 
-                try:
-                    await target_ws.send_text(private_payload)
-                except Exception:
-                    dead_clients.append((target_ws, target_uid, target_uname))
+                if is_self_message:
+                    try:
+                        await websocket.send_text(private_payload)
+                    except Exception:
+                        dead_clients.append((websocket, user_id, username))
+                else:
+                    try:
+                        await target_ws.send_text(private_payload)
+                    except Exception:
+                        dead_clients.append((target_ws, target_uid, target_uname))
 
-                try:
-                    await websocket.send_text(private_payload)
-                except Exception:
-                    dead_clients.append((websocket, user_id, username))
+                    try:
+                        await websocket.send_text(private_payload)
+                    except Exception:
+                        dead_clients.append((websocket, user_id, username))
 
                 for dead in dead_clients:
                     connected_clients.discard(dead)
