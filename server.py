@@ -366,12 +366,24 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         success = False
 
-                await websocket.send_text(json.dumps({
+                delete_payload = json.dumps({
                     "type": "private_message_deleted",
                     "message_id": message_id,
                     "peer_username": peer_username,
                     "success": success
-                }))
+                })
+
+                await websocket.send_text(delete_payload)
+
+                if success:
+                    target_client = find_client_by_username(peer_username)
+                    if target_client:
+                        target_ws, target_uid, target_uname = target_client
+                        try:
+                            await target_ws.send_text(delete_payload)
+                        except Exception:
+                            connected_clients.discard((target_ws, target_uid, target_uname))
+
                 continue
 
             if data.get("type") == "clear_private_dialog":
