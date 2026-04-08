@@ -226,6 +226,16 @@ async def clear_private_dialog(conn, current_user_id: int, peer_username: str):
     return True
 
 
+async def delete_favorites_message(conn, current_user_id: int, message_id: int):
+    result = await conn.execute("""
+        DELETE FROM private_messages
+        WHERE id = $1
+          AND from_user_id = $2
+          AND to_user_id = $2
+    """, message_id, current_user_id)
+    return result.endswith("1")
+
+
 # -------------------------
 # WebSocket чат
 # -------------------------
@@ -238,9 +248,6 @@ async def websocket_endpoint(websocket: WebSocket):
     username = None
 
     try:
-        # -------------------------
-        # Авторизация клиента
-        # -------------------------
         auth_raw = await websocket.receive_text()
         auth = json.loads(auth_raw)
 
@@ -261,9 +268,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await broadcast_system_message(f"{username} вошёл в чат")
 
-        # -------------------------
-        # История общего чата
-        # -------------------------
         rows = await conn.fetch("""
             SELECT messages.text, messages.created_at, users.username
             FROM messages
@@ -279,11 +283,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": row["created_at"]
             }))
 
-        # -------------------------
-        # История личных сообщений
-        # -------------------------
         private_rows = await conn.fetch("""
             SELECT
+                pm.id,
                 pm.text,
                 pm.created_at,
                 sender.username AS from_username,
@@ -298,29 +300,36 @@ async def websocket_endpoint(websocket: WebSocket):
         for row in private_rows:
             await websocket.send_text(json.dumps({
                 "type": "private_message",
+                "message_id": row["id"],
                 "from_username": row["from_username"],
                 "to_username": row["to_username"],
                 "text": row["text"],
                 "created_at": row["created_at"]
             }))
 
-        # -------------------------
-        # Непрочитанные ЛС
-        # -------------------------
         await send_unread_private_counts(websocket, conn, user_id)
-
         await broadcast_online_status()
 
-        # -------------------------
-        # Основной цикл
-        # -------------------------
         while True:
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
 
-            # -------------------------
-            # Очистить диалог
-            # -------------------------
+            if data.get("type") == "delete_favorites_message":
+                message_id = data.get("message_id")
+                success = False
+                if message_id is not None:
+                    try:
+                        success = await delete_favorites_message(conn, user_id, int(message_id))
+                    except Exception:
+                        success = False
+
+                await websocket.send_text(json.dumps({
+                    "type": "favorites_message_deleted",
+                    "message_id": message_id,
+                    "success": success
+                }))
+                continue
+
             if data.get("type") == "clear_private_dialog":
                 peer_username = data.get("peer_username", "").strip()
                 if peer_username:
@@ -335,9 +344,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_unread_private_counts(websocket, conn, user_id)
                 continue
 
-            # -------------------------
-            # Отметить ЛС как прочитанные
-            # -------------------------
             if data.get("type") == "mark_private_as_read":
                 from_username = data.get("from_username", "").strip()
                 if from_username:
@@ -345,9 +351,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_unread_private_counts(websocket, conn, user_id)
                 continue
 
-            # -------------------------
-            # Ping
-            # -------------------------
             if data.get("ping"):
                 dead_clients = []
                 for ws, uid, uname in connected_clients:
@@ -366,9 +369,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 continue
 
-            # -------------------------
-            # Текст сообщения
-            # -------------------------
             text = data.get("text", "").strip()
             if not text:
                 continue
@@ -376,9 +376,6 @@ async def websocket_endpoint(websocket: WebSocket):
             target_username = data.get("target_username")
             created_at = int(time.time())
 
-            # -------------------------
-            # Личное сообщение
-            # -------------------------
             if target_username and target_username != "Общий чат":
                 target_user = await conn.fetchrow(
                     "SELECT id, username FROM users WHERE username=$1",
@@ -399,10 +396,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 is_self_message = (target_uid == user_id)
 
-                await conn.execute(
+                inserted = await conn.fetchrow(
                     """
                     INSERT INTO private_messages (from_user_id, to_user_id, text, created_at, is_read)
                     VALUES ($1, $2, $3, $4, $5)
+                    RETURNING id
                     """,
                     user_id,
                     target_uid,
@@ -410,9 +408,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     created_at,
                     True if is_self_message else False
                 )
+                message_id = inserted["id"]
 
                 private_payload = json.dumps({
                     "type": "private_message",
+                    "message_id": message_id,
                     "from_username": username,
                     "to_username": target_uname,
                     "text": text,
@@ -444,9 +444,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 continue
 
-            # -------------------------
-            # Обычное сообщение в общий чат
-            # -------------------------
             await conn.execute(
                 "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
                 user_id,
