@@ -338,17 +338,22 @@ async def websocket_endpoint(websocket: WebSocket):
             # Личное сообщение
             # -------------------------
             if target_username and target_username != "Общий чат":
-                target_client = find_client_by_username(target_username)
+                target_user = await conn.fetchrow(
+                    "SELECT id, username FROM users WHERE username=$1",
+                    target_username
+                )
 
-                if not target_client:
+                if not target_user:
                     await websocket.send_text(json.dumps({
                         "type": "system_message",
-                        "text": f"Пользователь {target_username} сейчас не в сети",
+                        "text": f"Пользователь {target_username} не найден",
                         "created_at": created_at
                     }))
                     continue
 
-                target_ws, target_uid, target_uname = target_client
+                target_uid = target_user["id"]
+                target_uname = target_user["username"]
+                target_client = find_client_by_username(target_username)
 
                 is_self_message = (target_uid == user_id)
 
@@ -367,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 private_payload = json.dumps({
                     "type": "private_message",
                     "from_username": username,
-                    "to_username": target_username,
+                    "to_username": target_uname,
                     "text": text,
                     "created_at": created_at
                 })
@@ -380,10 +385,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         dead_clients.append((websocket, user_id, username))
                 else:
-                    try:
-                        await target_ws.send_text(private_payload)
-                    except Exception:
-                        dead_clients.append((target_ws, target_uid, target_uname))
+                    if target_client:
+                        target_ws, _, _ = target_client
+                        try:
+                            await target_ws.send_text(private_payload)
+                        except Exception:
+                            dead_clients.append(target_client)
 
                     try:
                         await websocket.send_text(private_payload)
