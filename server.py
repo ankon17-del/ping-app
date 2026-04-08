@@ -1,13 +1,14 @@
+
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncpg
-import os
-import json
-import time
 import base64
 import hashlib
 import hmac
+import json
+import os
+import time
 
 app = FastAPI()
 
@@ -25,8 +26,9 @@ app.add_middleware(
 DATABASE_URL = os.getenv("DATABASE_URL")
 connected_clients = set()  # (websocket, user_id, username)
 
-PBKDF2_ITERATIONS = 390000
-HASH_SCHEME = "pbkdf2_sha256"
+PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
+PASSWORD_HASH_ITERATIONS = 260000
+PASSWORD_SALT_BYTES = 16
 
 
 # -------------------------
@@ -52,54 +54,114 @@ async def get_conn():
 # -------------------------
 # Хеширование паролей
 # -------------------------
-def is_hashed_password(value: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    return value.startswith(f"{HASH_SCHEME}$")
-
-
 def hash_password(password: str) -> str:
-    salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac(
+    salt = os.urandom(PASSWORD_SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt,
-        PBKDF2_ITERATIONS,
+        PASSWORD_HASH_ITERATIONS,
     )
     salt_b64 = base64.b64encode(salt).decode("ascii")
-    digest_b64 = base64.b64encode(digest).decode("ascii")
-    return f"{HASH_SCHEME}${PBKDF2_ITERATIONS}${salt_b64}${digest_b64}"
+    dk_b64 = base64.b64encode(dk).decode("ascii")
+    return f"{PASSWORD_HASH_PREFIX}${PASSWORD_HASH_ITERATIONS}${salt_b64}${dk_b64}"
 
 
-def verify_hashed_password(password: str, stored_value: str) -> bool:
+def is_password_hash(value: str | None) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    return value.startswith(f"{PASSWORD_HASH_PREFIX}$")
+
+
+def verify_password(password: str, stored_value: str | None) -> bool:
+    if not stored_value:
+        return False
+
+    if not is_password_hash(stored_value):
+        return hmac.compare_digest(stored_value, password)
+
     try:
-        scheme, iterations_str, salt_b64, digest_b64 = stored_value.split("$", 3)
-        if scheme != HASH_SCHEME:
-            return False
-
+        _, iterations_str, salt_b64, dk_b64 = stored_value.split("$", 3)
         iterations = int(iterations_str)
         salt = base64.b64decode(salt_b64.encode("ascii"))
-        expected_digest = base64.b64decode(digest_b64.encode("ascii"))
-
-        actual_digest = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt,
-            iterations,
-        )
-        return hmac.compare_digest(actual_digest, expected_digest)
+        expected_dk = base64.b64decode(dk_b64.encode("ascii"))
     except Exception:
         return False
 
+    actual_dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(actual_dk, expected_dk)
 
-def verify_password(password: str, stored_value: str) -> bool:
-    if not isinstance(stored_value, str):
-        return False
 
-    if is_hashed_password(stored_value):
-        return verify_hashed_password(password, stored_value)
+# -------------------------
+# Схема БД
+# -------------------------
+async def ensure_schema():
+    conn = await get_conn()
+    try:
+        await conn.execute("""
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS edited_at BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE private_messages
+            ADD COLUMN IF NOT EXISTS edited_at BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE private_messages
+            ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT
+        """)
 
-    return hmac.compare_digest(password, stored_value)
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'messages_reply_to_message_id_fkey'
+                ) THEN
+                    ALTER TABLE messages
+                    ADD CONSTRAINT messages_reply_to_message_id_fkey
+                    FOREIGN KEY (reply_to_message_id)
+                    REFERENCES messages(id)
+                    ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
+        """)
+
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'private_messages_reply_to_message_id_fkey'
+                ) THEN
+                    ALTER TABLE private_messages
+                    ADD CONSTRAINT private_messages_reply_to_message_id_fkey
+                    FOREIGN KEY (reply_to_message_id)
+                    REFERENCES private_messages(id)
+                    ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
+        """)
+    finally:
+        await conn.close()
+
+
+@app.on_event("startup")
+async def startup_event():
+    await ensure_schema()
 
 
 # -------------------------
@@ -117,19 +179,22 @@ async def root():
 async def register(data: RegisterData):
     conn = await get_conn()
     try:
+        username_value = data.username.strip()
+        password_value = data.password
+
         existing = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1",
-            data.username
+            "SELECT id FROM users WHERE username=$1",
+            username_value
         )
         if existing:
             return {"success": False, "message": "Username already exists"}
 
-        password_hash = hash_password(data.password)
+        hashed_password = hash_password(password_value)
 
         await conn.execute(
             "INSERT INTO users (username, password) VALUES ($1, $2)",
-            data.username,
-            password_hash,
+            username_value,
+            hashed_password,
         )
         return {"success": True, "message": "Registered successfully"}
 
@@ -148,31 +213,35 @@ async def register(data: RegisterData):
 async def login(data: LoginData):
     conn = await get_conn()
     try:
+        username_value = data.username.strip()
+        password_value = data.password
+
         user = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1",
-            data.username,
+            "SELECT id, username, password FROM users WHERE username=$1",
+            username_value,
         )
 
         if not user:
             return {"success": False, "message": "Invalid username or password"}
 
         stored_password = user["password"]
-        if not verify_password(data.password, stored_password):
-            return {"success": False, "message": "Invalid username or password"}
 
-        if not is_hashed_password(stored_password):
-            upgraded_hash = hash_password(data.password)
-            await conn.execute(
-                "UPDATE users SET password=$1 WHERE id=$2",
-                upgraded_hash,
-                user["id"],
-            )
+        if verify_password(password_value, stored_password):
+            if not is_password_hash(stored_password):
+                new_hash = hash_password(password_value)
+                await conn.execute(
+                    "UPDATE users SET password=$1 WHERE id=$2",
+                    new_hash,
+                    user["id"]
+                )
 
-        return {
-            "success": True,
-            "user_id": user["id"],
-            "username": user["username"],
-        }
+            return {
+                "success": True,
+                "user_id": user["id"],
+                "username": user["username"],
+            }
+
+        return {"success": False, "message": "Invalid username or password"}
 
     except Exception as e:
         print("LOGIN ERROR:", e)
@@ -185,6 +254,74 @@ async def login(data: LoginData):
 # -------------------------
 # Вспомогательные функции
 # -------------------------
+def build_reply_preview(reply_username, reply_text, reply_created_at):
+    if not reply_text:
+        return None
+
+    preview_text = str(reply_text).replace("\n", " ").strip()
+    if len(preview_text) > 120:
+        preview_text = preview_text[:117] + "..."
+
+    return {
+        "username": reply_username or "",
+        "text": preview_text,
+        "created_at": reply_created_at,
+    }
+
+
+def build_chat_message_payload(
+    *,
+    message_id,
+    username,
+    text,
+    created_at,
+    edited_at=None,
+    reply_to_message_id=None,
+    reply_preview=None,
+):
+    return {
+        "type": "chat_message",
+        "message_id": message_id,
+        "username": username,
+        "text": text,
+        "created_at": created_at,
+        "edited_at": edited_at,
+        "reply_to_message_id": reply_to_message_id,
+        "reply_preview": reply_preview,
+    }
+
+
+def build_private_message_payload(
+    *,
+    message_id,
+    from_username,
+    to_username,
+    text,
+    created_at,
+    edited_at=None,
+    reply_to_message_id=None,
+    reply_preview=None,
+):
+    return {
+        "type": "private_message",
+        "message_id": message_id,
+        "from_username": from_username,
+        "to_username": to_username,
+        "text": text,
+        "created_at": created_at,
+        "edited_at": edited_at,
+        "reply_to_message_id": reply_to_message_id,
+        "reply_preview": reply_preview,
+    }
+
+
+def find_client_by_username(target_username: str):
+    for ws, uid, uname in connected_clients:
+        if uname == target_username:
+            return ws, uid, uname
+    return None
+
+
 async def broadcast_online_status():
     conn = await get_conn()
     try:
@@ -231,13 +368,6 @@ async def broadcast_system_message(text: str):
 
     for dead in dead_clients:
         connected_clients.discard(dead)
-
-
-def find_client_by_username(target_username: str):
-    for ws, uid, uname in connected_clients:
-        if uname == target_username:
-            return ws, uid, uname
-    return None
 
 
 async def send_unread_private_counts(websocket: WebSocket, conn, current_user_id: int):
@@ -329,6 +459,159 @@ async def delete_private_message(conn, current_user_id: int, peer_username: str,
     return result.endswith("1")
 
 
+async def get_public_reply_row(conn, reply_to_message_id: int):
+    return await conn.fetchrow("""
+        SELECT
+            m.id,
+            m.text,
+            m.created_at,
+            u.username
+        FROM messages m
+        JOIN users u ON m.user_id = u.id
+        WHERE m.id = $1
+    """, reply_to_message_id)
+
+
+async def get_private_reply_row(conn, current_user_id: int, target_user_id: int, reply_to_message_id: int):
+    return await conn.fetchrow("""
+        SELECT
+            pm.id,
+            pm.text,
+            pm.created_at,
+            sender.username AS from_username,
+            pm.from_user_id,
+            pm.to_user_id
+        FROM private_messages pm
+        JOIN users sender ON pm.from_user_id = sender.id
+        WHERE pm.id = $1
+          AND (
+                (pm.from_user_id = $2 AND pm.to_user_id = $3)
+             OR (pm.from_user_id = $3 AND pm.to_user_id = $2)
+          )
+    """, reply_to_message_id, current_user_id, target_user_id)
+
+
+async def send_public_history(websocket: WebSocket, conn):
+    rows = await conn.fetch("""
+        SELECT
+            m.id,
+            m.text,
+            m.created_at,
+            m.edited_at,
+            m.reply_to_message_id,
+            u.username,
+            rm.text AS reply_text,
+            rm.created_at AS reply_created_at,
+            ru.username AS reply_username
+        FROM messages m
+        JOIN users u ON m.user_id = u.id
+        LEFT JOIN messages rm ON m.reply_to_message_id = rm.id
+        LEFT JOIN users ru ON rm.user_id = ru.id
+        ORDER BY m.id DESC
+        LIMIT 1000
+    """)
+
+    for row in reversed(rows):
+        reply_preview = build_reply_preview(
+            row["reply_username"],
+            row["reply_text"],
+            row["reply_created_at"],
+        )
+        payload = build_chat_message_payload(
+            message_id=row["id"],
+            username=row["username"],
+            text=row["text"],
+            created_at=row["created_at"],
+            edited_at=row["edited_at"],
+            reply_to_message_id=row["reply_to_message_id"],
+            reply_preview=reply_preview,
+        )
+        await websocket.send_text(json.dumps(payload))
+
+
+async def send_private_history(websocket: WebSocket, conn, user_id: int):
+    private_rows = await conn.fetch("""
+        SELECT
+            pm.id,
+            pm.text,
+            pm.created_at,
+            pm.edited_at,
+            pm.reply_to_message_id,
+            sender.username AS from_username,
+            receiver.username AS to_username,
+            reply_sender.username AS reply_username,
+            rpm.text AS reply_text,
+            rpm.created_at AS reply_created_at
+        FROM private_messages pm
+        JOIN users sender ON pm.from_user_id = sender.id
+        JOIN users receiver ON pm.to_user_id = receiver.id
+        LEFT JOIN private_messages rpm ON pm.reply_to_message_id = rpm.id
+        LEFT JOIN users reply_sender ON rpm.from_user_id = reply_sender.id
+        WHERE pm.from_user_id = $1 OR pm.to_user_id = $1
+        ORDER BY pm.id ASC
+    """, user_id)
+
+    for row in private_rows:
+        reply_preview = build_reply_preview(
+            row["reply_username"],
+            row["reply_text"],
+            row["reply_created_at"],
+        )
+        payload = build_private_message_payload(
+            message_id=row["id"],
+            from_username=row["from_username"],
+            to_username=row["to_username"],
+            text=row["text"],
+            created_at=row["created_at"],
+            edited_at=row["edited_at"],
+            reply_to_message_id=row["reply_to_message_id"],
+            reply_preview=reply_preview,
+        )
+        await websocket.send_text(json.dumps(payload))
+
+
+async def broadcast_to_all(payload: dict):
+    payload_text = json.dumps(payload)
+    dead_clients = []
+
+    for ws, uid, uname in connected_clients:
+        try:
+            await ws.send_text(payload_text)
+        except Exception:
+            dead_clients.append((ws, uid, uname))
+
+    for dead in dead_clients:
+        connected_clients.discard(dead)
+
+
+async def send_private_payload_to_participants(
+    payload: dict,
+    sender_ws: WebSocket,
+    sender_user_id: int,
+    sender_username: str,
+    target_username: str | None,
+):
+    payload_text = json.dumps(payload)
+    dead_clients = []
+
+    try:
+        await sender_ws.send_text(payload_text)
+    except Exception:
+        dead_clients.append((sender_ws, sender_user_id, sender_username))
+
+    if target_username and target_username != sender_username:
+        target_client = find_client_by_username(target_username)
+        if target_client:
+            target_ws, target_uid, target_uname = target_client
+            try:
+                await target_ws.send_text(payload_text)
+            except Exception:
+                dead_clients.append((target_ws, target_uid, target_uname))
+
+    for dead in dead_clients:
+        connected_clients.discard(dead)
+
+
 # -------------------------
 # WebSocket чат
 # -------------------------
@@ -361,53 +644,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await broadcast_system_message(f"{username} вошёл в чат")
 
-        rows = await conn.fetch("""
-            SELECT messages.text, messages.created_at, users.username
-            FROM messages
-            JOIN users ON messages.user_id = users.id
-            ORDER BY messages.id DESC
-            LIMIT 1000
-        """)
-        for row in reversed(rows):
-            await websocket.send_text(json.dumps({
-                "type": "chat_message",
-                "username": row["username"],
-                "text": row["text"],
-                "created_at": row["created_at"]
-            }))
-
-        private_rows = await conn.fetch("""
-            SELECT
-                pm.id,
-                pm.text,
-                pm.created_at,
-                sender.username AS from_username,
-                receiver.username AS to_username
-            FROM private_messages pm
-            JOIN users sender ON pm.from_user_id = sender.id
-            JOIN users receiver ON pm.to_user_id = receiver.id
-            WHERE pm.from_user_id = $1 OR pm.to_user_id = $1
-            ORDER BY pm.id ASC
-        """, user_id)
-
-        for row in private_rows:
-            await websocket.send_text(json.dumps({
-                "type": "private_message",
-                "message_id": row["id"],
-                "from_username": row["from_username"],
-                "to_username": row["to_username"],
-                "text": row["text"],
-                "created_at": row["created_at"]
-            }))
-
+        await send_public_history(websocket, conn)
+        await send_private_history(websocket, conn, user_id)
         await send_unread_private_counts(websocket, conn, user_id)
         await broadcast_online_status()
 
         while True:
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
+            msg_type = data.get("type")
 
-            if data.get("type") == "delete_favorites_message":
+            if msg_type == "delete_favorites_message":
                 message_id = data.get("message_id")
                 success = False
                 if message_id is not None:
@@ -423,7 +670,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
                 continue
 
-            if data.get("type") == "delete_private_message":
+            if msg_type == "delete_private_message":
                 message_id = data.get("message_id")
                 peer_username = data.get("peer_username", "").strip()
                 success = False
@@ -439,60 +686,218 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         success = False
 
-                delete_payload = json.dumps({
+                delete_payload = {
                     "type": "private_message_deleted",
                     "message_id": message_id,
                     "peer_username": peer_username,
                     "success": success
-                })
+                }
 
-                await websocket.send_text(delete_payload)
+                await websocket.send_text(json.dumps(delete_payload))
 
                 if success:
                     target_client = find_client_by_username(peer_username)
                     if target_client:
                         target_ws, target_uid, target_uname = target_client
                         try:
-                            await target_ws.send_text(delete_payload)
+                            await target_ws.send_text(json.dumps(delete_payload))
                         except Exception:
                             connected_clients.discard((target_ws, target_uid, target_uname))
-
                 continue
 
-            if data.get("type") == "clear_private_dialog":
+            if msg_type == "clear_private_dialog":
                 peer_username = data.get("peer_username", "").strip()
                 if peer_username:
                     success = await clear_private_dialog(conn, user_id, peer_username)
 
-                    requester_payload = json.dumps({
+                    requester_payload = {
                         "type": "private_dialog_cleared",
                         "peer_username": peer_username,
                         "success": success
-                    })
-                    await websocket.send_text(requester_payload)
+                    }
+                    await websocket.send_text(json.dumps(requester_payload))
                     await send_unread_private_counts(websocket, conn, user_id)
 
                     if success and peer_username != username:
                         target_client = find_client_by_username(peer_username)
                         if target_client:
                             target_ws, target_uid, target_uname = target_client
-                            target_payload = json.dumps({
+                            target_payload = {
                                 "type": "private_dialog_cleared",
                                 "peer_username": username,
                                 "success": True
-                            })
+                            }
                             try:
-                                await target_ws.send_text(target_payload)
+                                await target_ws.send_text(json.dumps(target_payload))
                                 await send_unread_private_counts(target_ws, conn, target_uid)
                             except Exception:
                                 connected_clients.discard((target_ws, target_uid, target_uname))
                 continue
 
-            if data.get("type") == "mark_private_as_read":
+            if msg_type == "mark_private_as_read":
                 from_username = data.get("from_username", "").strip()
                 if from_username:
                     await mark_private_messages_as_read(conn, user_id, from_username)
                     await send_unread_private_counts(websocket, conn, user_id)
+                continue
+
+            if msg_type == "edit_chat_message":
+                message_id = data.get("message_id")
+                new_text = str(data.get("text", "")).strip()
+
+                if message_id is None or not new_text:
+                    await websocket.send_text(json.dumps({
+                        "type": "chat_message_edited",
+                        "message_id": message_id,
+                        "success": False
+                    }))
+                    continue
+
+                try:
+                    message_id = int(message_id)
+                except Exception:
+                    await websocket.send_text(json.dumps({
+                        "type": "chat_message_edited",
+                        "message_id": data.get("message_id"),
+                        "success": False
+                    }))
+                    continue
+
+                edited_at = int(time.time())
+                row = await conn.fetchrow("""
+                    UPDATE messages
+                    SET text = $1,
+                        edited_at = $2
+                    WHERE id = $3
+                      AND user_id = $4
+                    RETURNING id, text, created_at, edited_at, reply_to_message_id
+                """, new_text, edited_at, message_id, user_id)
+
+                if not row:
+                    await websocket.send_text(json.dumps({
+                        "type": "chat_message_edited",
+                        "message_id": message_id,
+                        "success": False
+                    }))
+                    continue
+
+                reply_preview = None
+                if row["reply_to_message_id"] is not None:
+                    reply_row = await get_public_reply_row(conn, int(row["reply_to_message_id"]))
+                    if reply_row:
+                        reply_preview = build_reply_preview(
+                            reply_row["username"],
+                            reply_row["text"],
+                            reply_row["created_at"],
+                        )
+
+                payload = {
+                    "type": "chat_message_edited",
+                    "success": True,
+                    "message_id": row["id"],
+                    "username": username,
+                    "text": row["text"],
+                    "created_at": row["created_at"],
+                    "edited_at": row["edited_at"],
+                    "reply_to_message_id": row["reply_to_message_id"],
+                    "reply_preview": reply_preview,
+                }
+                await broadcast_to_all(payload)
+                continue
+
+            if msg_type == "edit_private_message":
+                message_id = data.get("message_id")
+                peer_username = str(data.get("peer_username", "")).strip()
+                new_text = str(data.get("text", "")).strip()
+
+                if message_id is None or not peer_username or not new_text:
+                    await websocket.send_text(json.dumps({
+                        "type": "private_message_edited",
+                        "message_id": message_id,
+                        "peer_username": peer_username,
+                        "success": False
+                    }))
+                    continue
+
+                try:
+                    message_id = int(message_id)
+                except Exception:
+                    await websocket.send_text(json.dumps({
+                        "type": "private_message_edited",
+                        "message_id": data.get("message_id"),
+                        "peer_username": peer_username,
+                        "success": False
+                    }))
+                    continue
+
+                target_user = await conn.fetchrow(
+                    "SELECT id, username FROM users WHERE username=$1",
+                    peer_username
+                )
+                if not target_user:
+                    await websocket.send_text(json.dumps({
+                        "type": "private_message_edited",
+                        "message_id": message_id,
+                        "peer_username": peer_username,
+                        "success": False
+                    }))
+                    continue
+
+                edited_at = int(time.time())
+                row = await conn.fetchrow("""
+                    UPDATE private_messages
+                    SET text = $1,
+                        edited_at = $2
+                    WHERE id = $3
+                      AND from_user_id = $4
+                      AND to_user_id = $5
+                    RETURNING id, text, created_at, edited_at, reply_to_message_id
+                """, new_text, edited_at, message_id, user_id, target_user["id"])
+
+                if not row:
+                    await websocket.send_text(json.dumps({
+                        "type": "private_message_edited",
+                        "message_id": message_id,
+                        "peer_username": peer_username,
+                        "success": False
+                    }))
+                    continue
+
+                reply_preview = None
+                if row["reply_to_message_id"] is not None:
+                    reply_row = await get_private_reply_row(
+                        conn,
+                        user_id,
+                        target_user["id"],
+                        int(row["reply_to_message_id"])
+                    )
+                    if reply_row:
+                        reply_preview = build_reply_preview(
+                            reply_row["from_username"],
+                            reply_row["text"],
+                            reply_row["created_at"],
+                        )
+
+                payload = {
+                    "type": "private_message_edited",
+                    "success": True,
+                    "message_id": row["id"],
+                    "peer_username": peer_username,
+                    "from_username": username,
+                    "to_username": target_user["username"],
+                    "text": row["text"],
+                    "created_at": row["created_at"],
+                    "edited_at": row["edited_at"],
+                    "reply_to_message_id": row["reply_to_message_id"],
+                    "reply_preview": reply_preview,
+                }
+                await send_private_payload_to_participants(
+                    payload,
+                    websocket,
+                    user_id,
+                    username,
+                    target_user["username"],
+                )
                 continue
 
             if data.get("ping"):
@@ -510,10 +915,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 for dead in dead_clients:
                     connected_clients.discard(dead)
-
                 continue
 
-            text = data.get("text", "").strip()
+            text = str(data.get("text", "")).strip()
             if not text:
                 continue
 
@@ -536,81 +940,118 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 target_uid = target_user["id"]
                 target_uname = target_user["username"]
-                target_client = find_client_by_username(target_username)
+                reply_to_message_id = data.get("reply_to_message_id")
 
+                valid_reply_message_id = None
+                reply_preview = None
+
+                if reply_to_message_id is not None:
+                    try:
+                        reply_to_message_id = int(reply_to_message_id)
+                        reply_row = await get_private_reply_row(
+                            conn,
+                            user_id,
+                            target_uid,
+                            reply_to_message_id
+                        )
+                        if reply_row:
+                            valid_reply_message_id = reply_row["id"]
+                            reply_preview = build_reply_preview(
+                                reply_row["from_username"],
+                                reply_row["text"],
+                                reply_row["created_at"],
+                            )
+                    except Exception:
+                        valid_reply_message_id = None
+                        reply_preview = None
+
+                target_client = find_client_by_username(target_username)
                 is_self_message = (target_uid == user_id)
 
                 inserted = await conn.fetchrow(
                     """
-                    INSERT INTO private_messages (from_user_id, to_user_id, text, created_at, is_read)
-                    VALUES ($1, $2, $3, $4, $5)
-                    RETURNING id
+                    INSERT INTO private_messages (
+                        from_user_id,
+                        to_user_id,
+                        text,
+                        created_at,
+                        is_read,
+                        reply_to_message_id
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id, edited_at, reply_to_message_id
                     """,
                     user_id,
                     target_uid,
                     text,
                     created_at,
-                    True if is_self_message else False
+                    True if is_self_message else False,
+                    valid_reply_message_id
                 )
                 message_id = inserted["id"]
 
-                private_payload = json.dumps({
-                    "type": "private_message",
-                    "message_id": message_id,
-                    "from_username": username,
-                    "to_username": target_uname,
-                    "text": text,
-                    "created_at": created_at
-                })
+                private_payload = build_private_message_payload(
+                    message_id=message_id,
+                    from_username=username,
+                    to_username=target_uname,
+                    text=text,
+                    created_at=created_at,
+                    edited_at=inserted["edited_at"],
+                    reply_to_message_id=inserted["reply_to_message_id"],
+                    reply_preview=reply_preview,
+                )
 
-                dead_clients = []
-
-                if is_self_message:
-                    try:
-                        await websocket.send_text(private_payload)
-                    except Exception:
-                        dead_clients.append((websocket, user_id, username))
-                else:
-                    if target_client:
-                        target_ws, _, _ = target_client
-                        try:
-                            await target_ws.send_text(private_payload)
-                        except Exception:
-                            dead_clients.append(target_client)
-
-                    try:
-                        await websocket.send_text(private_payload)
-                    except Exception:
-                        dead_clients.append((websocket, user_id, username))
-
-                for dead in dead_clients:
-                    connected_clients.discard(dead)
-
+                await send_private_payload_to_participants(
+                    private_payload,
+                    websocket,
+                    user_id,
+                    username,
+                    None if is_self_message else target_uname,
+                )
                 continue
 
-            await conn.execute(
-                "INSERT INTO messages (user_id, text, created_at) VALUES ($1, $2, $3)",
+            reply_to_message_id = data.get("reply_to_message_id")
+            valid_reply_message_id = None
+            reply_preview = None
+
+            if reply_to_message_id is not None:
+                try:
+                    reply_to_message_id = int(reply_to_message_id)
+                    reply_row = await get_public_reply_row(conn, reply_to_message_id)
+                    if reply_row:
+                        valid_reply_message_id = reply_row["id"]
+                        reply_preview = build_reply_preview(
+                            reply_row["username"],
+                            reply_row["text"],
+                            reply_row["created_at"],
+                        )
+                except Exception:
+                    valid_reply_message_id = None
+                    reply_preview = None
+
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO messages (user_id, text, created_at, reply_to_message_id)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, edited_at, reply_to_message_id
+                """,
                 user_id,
                 text,
-                created_at
+                created_at,
+                valid_reply_message_id
             )
 
-            message_to_send = json.dumps({
-                "type": "chat_message",
-                "username": username,
-                "text": text,
-                "created_at": created_at
-            })
+            message_to_send = build_chat_message_payload(
+                message_id=inserted["id"],
+                username=username,
+                text=text,
+                created_at=created_at,
+                edited_at=inserted["edited_at"],
+                reply_to_message_id=inserted["reply_to_message_id"],
+                reply_preview=reply_preview,
+            )
 
-            dead_clients = []
-            for ws, uid, uname in connected_clients:
-                try:
-                    await ws.send_text(message_to_send)
-                except Exception:
-                    dead_clients.append((ws, uid, uname))
-
-            for dead in dead_clients:
-                connected_clients.discard(dead)
+            await broadcast_to_all(message_to_send)
 
     except Exception as e:
         print("WebSocket error:", e)
