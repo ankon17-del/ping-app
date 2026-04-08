@@ -220,6 +220,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": row["created_at"]
             }))
 
+        # -------------------------
+        # История личных сообщений
+        # -------------------------
+        private_rows = await conn.fetch("""
+            SELECT
+                pm.text,
+                pm.created_at,
+                sender.username AS from_username,
+                receiver.username AS to_username
+            FROM private_messages pm
+            JOIN users sender ON pm.from_user_id = sender.id
+            JOIN users receiver ON pm.to_user_id = receiver.id
+            WHERE pm.from_user_id = $1 OR pm.to_user_id = $1
+            ORDER BY pm.id ASC
+            LIMIT 200
+        """, user_id)
+
+        for row in private_rows:
+            await websocket.send_text(json.dumps({
+                "type": "private_message",
+                "from_username": row["from_username"],
+                "to_username": row["to_username"],
+                "text": row["text"],
+                "created_at": row["created_at"]
+            }))
+
         await broadcast_online_status()
 
         # -------------------------
