@@ -167,6 +167,40 @@ def find_client_by_username(target_username: str):
     return None
 
 
+async def send_unread_private_counts(websocket: WebSocket, conn, current_user_id: int):
+    rows = await conn.fetch("""
+        SELECT sender.username, COUNT(*) AS unread_count
+        FROM private_messages pm
+        JOIN users sender ON pm.from_user_id = sender.id
+        WHERE pm.to_user_id = $1 AND pm.is_read = FALSE
+        GROUP BY sender.username
+    """, current_user_id)
+
+    counts = {row["username"]: int(row["unread_count"]) for row in rows}
+
+    await websocket.send_text(json.dumps({
+        "type": "unread_private_counts",
+        "counts": counts
+    }))
+
+
+async def mark_private_messages_as_read(conn, current_user_id: int, from_username: str):
+    sender = await conn.fetchrow(
+        "SELECT id FROM users WHERE username=$1",
+        from_username
+    )
+    if not sender:
+        return
+
+    await conn.execute("""
+        UPDATE private_messages
+        SET is_read = TRUE
+        WHERE to_user_id = $1
+          AND from_user_id = $2
+          AND is_read = FALSE
+    """, current_user_id, sender["id"])
+
+
 # -------------------------
 # WebSocket чат
 # -------------------------
@@ -246,6 +280,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": row["created_at"]
             }))
 
+        # -------------------------
+        # Непрочитанные ЛС
+        # -------------------------
+        await send_unread_private_counts(websocket, conn, user_id)
+
         await broadcast_online_status()
 
         # -------------------------
@@ -254,6 +293,16 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             msg_raw = await websocket.receive_text()
             data = json.loads(msg_raw)
+
+            # -------------------------
+            # Отметить ЛС как прочитанные
+            # -------------------------
+            if data.get("type") == "mark_private_as_read":
+                from_username = data.get("from_username", "").strip()
+                if from_username:
+                    await mark_private_messages_as_read(conn, user_id, from_username)
+                    await send_unread_private_counts(websocket, conn, user_id)
+                continue
 
             # -------------------------
             # Ping
@@ -304,8 +353,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await conn.execute(
                     """
-                    INSERT INTO private_messages (from_user_id, to_user_id, text, created_at)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO private_messages (from_user_id, to_user_id, text, created_at, is_read)
+                    VALUES ($1, $2, $3, $4, FALSE)
                     """,
                     user_id,
                     target_uid,
