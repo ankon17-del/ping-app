@@ -5,6 +5,7 @@ import asyncpg
 import os
 import json
 import time
+import bcrypt
 
 app = FastAPI()
 
@@ -21,6 +22,33 @@ app.add_middleware(
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 connected_clients = set()  # (websocket, user_id, username)
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def looks_like_bcrypt_hash(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.startswith("$2a$") or value.startswith("$2b$") or value.startswith("$2y$")
+
+
+def verify_password(password: str, stored_password: str) -> bool:
+    if not stored_password:
+        return False
+
+    if looks_like_bcrypt_hash(stored_password):
+        try:
+            return bcrypt.checkpw(
+                password.encode("utf-8"),
+                stored_password.encode("utf-8")
+            )
+        except Exception:
+            return False
+
+    return password == stored_password
+
 
 
 # -------------------------
@@ -58,17 +86,25 @@ async def root():
 async def register(data: RegisterData):
     conn = await get_conn()
     try:
+        username = data.username.strip()
+        password = data.password
+
+        if not username or not password:
+            return {"success": False, "message": "Username and password are required"}
+
         existing = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1",
-            data.username
+            "SELECT id FROM users WHERE username=$1",
+            username
         )
         if existing:
             return {"success": False, "message": "Username already exists"}
 
+        password_hash = hash_password(password)
+
         await conn.execute(
             "INSERT INTO users (username, password) VALUES ($1, $2)",
-            data.username,
-            data.password,
+            username,
+            password_hash,
         )
         return {"success": True, "message": "Registered successfully"}
 
@@ -87,19 +123,41 @@ async def register(data: RegisterData):
 async def login(data: LoginData):
     conn = await get_conn()
     try:
-        user = await conn.fetchrow(
-            "SELECT * FROM users WHERE username=$1 AND password=$2",
-            data.username,
-            data.password,
-        )
-        if user:
-            return {
-                "success": True,
-                "user_id": user["id"],
-                "username": user["username"],
-            }
-        else:
+        username = data.username.strip()
+        password = data.password
+
+        if not username or not password:
             return {"success": False, "message": "Invalid username or password"}
+
+        user = await conn.fetchrow(
+            "SELECT * FROM users WHERE username=$1",
+            username,
+        )
+
+        if not user:
+            return {"success": False, "message": "Invalid username or password"}
+
+        stored_password = user["password"]
+
+        if not verify_password(password, stored_password):
+            return {"success": False, "message": "Invalid username or password"}
+
+        if not looks_like_bcrypt_hash(stored_password):
+            try:
+                upgraded_hash = hash_password(password)
+                await conn.execute(
+                    "UPDATE users SET password=$1 WHERE id=$2",
+                    upgraded_hash,
+                    user["id"]
+                )
+            except Exception as migrate_error:
+                print("PASSWORD MIGRATION ERROR:", migrate_error)
+
+        return {
+            "success": True,
+            "user_id": user["id"],
+            "username": user["username"],
+        }
 
     except Exception as e:
         print("LOGIN ERROR:", e)
