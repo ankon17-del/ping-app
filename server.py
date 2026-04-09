@@ -1,6 +1,6 @@
-
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import asyncpg
 import os
@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import base64
 import secrets
+import uuid
 
 app = FastAPI()
 
@@ -23,6 +24,9 @@ app.add_middleware(
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 connected_clients = set()  # (websocket, user_id, username)
+
+AUDIO_STORAGE_DIR = os.getenv("AUDIO_STORAGE_DIR", "private_audio_files")
+os.makedirs(AUDIO_STORAGE_DIR, exist_ok=True)
 
 
 class RegisterData(BaseModel):
@@ -123,6 +127,18 @@ async def ensure_schema():
         await conn.execute("""
             ALTER TABLE private_messages
             ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS private_audio_messages (
+                id BIGSERIAL PRIMARY KEY,
+                from_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                to_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                original_file_name TEXT NULL,
+                duration_seconds INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL,
+                is_read BOOLEAN NOT NULL DEFAULT FALSE
+            )
         """)
     finally:
         await conn.close()
@@ -271,7 +287,17 @@ async def send_unread_private_counts(websocket: WebSocket, conn, current_user_id
         GROUP BY sender.username
     """, current_user_id)
 
+    audio_rows = await conn.fetch("""
+        SELECT sender.username, COUNT(*) AS unread_count
+        FROM private_audio_messages pam
+        JOIN users sender ON pam.from_user_id = sender.id
+        WHERE pam.to_user_id = $1 AND pam.is_read = FALSE
+        GROUP BY sender.username
+    """, current_user_id)
+
     counts = {row["username"]: int(row["unread_count"]) for row in rows}
+    for row in audio_rows:
+        counts[row["username"]] = counts.get(row["username"], 0) + int(row["unread_count"])
 
     await websocket.send_text(json.dumps({
         "type": "unread_private_counts",
@@ -295,6 +321,14 @@ async def mark_private_messages_as_read(conn, current_user_id: int, from_usernam
           AND is_read = FALSE
     """, current_user_id, sender["id"])
 
+    await conn.execute("""
+        UPDATE private_audio_messages
+        SET is_read = TRUE
+        WHERE to_user_id = $1
+          AND from_user_id = $2
+          AND is_read = FALSE
+    """, current_user_id, sender["id"])
+
 
 async def clear_private_dialog(conn, current_user_id: int, peer_username: str):
     peer = await conn.fetchrow(
@@ -311,6 +345,10 @@ async def clear_private_dialog(conn, current_user_id: int, peer_username: str):
             DELETE FROM private_messages
             WHERE from_user_id = $1 AND to_user_id = $1
         """, current_user_id)
+        await conn.execute("""
+            DELETE FROM private_audio_messages
+            WHERE from_user_id = $1 AND to_user_id = $1
+        """, current_user_id)
         return True
 
     await conn.execute("""
@@ -318,6 +356,13 @@ async def clear_private_dialog(conn, current_user_id: int, peer_username: str):
         WHERE (from_user_id = $1 AND to_user_id = $2)
            OR (from_user_id = $2 AND to_user_id = $1)
     """, current_user_id, peer_id)
+
+    await conn.execute("""
+        DELETE FROM private_audio_messages
+        WHERE (from_user_id = $1 AND to_user_id = $2)
+           OR (from_user_id = $2 AND to_user_id = $1)
+    """, current_user_id, peer_id)
+
     return True
 
 
@@ -408,6 +453,156 @@ async def get_private_message_reply_preview(conn, reply_to_message_id):
         "created_at": row["created_at"],
         "edited_at": row["edited_at"],
     }
+
+
+def build_private_audio_payload(
+    *,
+    audio_id: int,
+    from_username: str,
+    to_username: str,
+    file_name: str,
+    original_file_name: str | None,
+    duration_seconds: int,
+    created_at: int,
+):
+    return {
+        "type": "private_audio_message",
+        "audio_id": audio_id,
+        "from_username": from_username,
+        "to_username": to_username,
+        "file_name": file_name,
+        "original_file_name": original_file_name,
+        "duration_seconds": duration_seconds,
+        "created_at": created_at,
+        "audio_url": f"/private-audio/{file_name}",
+    }
+
+
+# -------------------------
+# Audio endpoints
+# -------------------------
+@app.post("/upload_private_audio")
+async def upload_private_audio(
+    sender_user_id: int = Form(...),
+    sender_username: str = Form(...),
+    target_username: str = Form(...),
+    duration_seconds: int = Form(0),
+    audio: UploadFile = File(...),
+):
+    conn = await get_conn()
+    try:
+        sender = await conn.fetchrow(
+            "SELECT id, username FROM users WHERE id=$1",
+            sender_user_id
+        )
+        if not sender or sender["username"] != sender_username:
+            raise HTTPException(status_code=400, detail="Invalid sender")
+
+        target = await conn.fetchrow(
+            "SELECT id, username FROM users WHERE username=$1",
+            target_username
+        )
+        if not target:
+            raise HTTPException(status_code=404, detail="Target user not found")
+
+        target_user_id = target["id"]
+        target_user_name = target["username"]
+        is_self_message = target_user_id == sender_user_id
+
+        original_name = audio.filename or "audio_message.bin"
+        ext = os.path.splitext(original_name)[1].lower()
+        if not ext:
+            ext = ".bin"
+
+        safe_file_name = f"{uuid.uuid4().hex}{ext}"
+        file_path = os.path.join(AUDIO_STORAGE_DIR, safe_file_name)
+
+        file_bytes = await audio.read()
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+        created_at = int(time.time())
+
+        inserted = await conn.fetchrow("""
+            INSERT INTO private_audio_messages (
+                from_user_id,
+                to_user_id,
+                file_name,
+                original_file_name,
+                duration_seconds,
+                created_at,
+                is_read
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, file_name, original_file_name, duration_seconds, created_at
+        """,
+            sender_user_id,
+            target_user_id,
+            safe_file_name,
+            original_name,
+            max(0, int(duration_seconds)),
+            created_at,
+            True if is_self_message else False
+        )
+
+        payload_dict = build_private_audio_payload(
+            audio_id=inserted["id"],
+            from_username=sender_username,
+            to_username=target_user_name,
+            file_name=inserted["file_name"],
+            original_file_name=inserted["original_file_name"],
+            duration_seconds=int(inserted["duration_seconds"]),
+            created_at=int(inserted["created_at"]),
+        )
+        payload = json.dumps(payload_dict)
+
+        dead_clients = []
+
+        try:
+            sender_client = find_client_by_username(sender_username)
+            if sender_client:
+                sender_ws, sender_uid, sender_uname = sender_client
+                await sender_ws.send_text(payload)
+        except Exception:
+            if sender_client:
+                dead_clients.append(sender_client)
+
+        if not is_self_message:
+            target_client = find_client_by_username(target_user_name)
+            if target_client:
+                try:
+                    target_ws, target_uid, target_uname = target_client
+                    await target_ws.send_text(payload)
+                    await send_unread_private_counts(target_ws, conn, target_uid)
+                except Exception:
+                    dead_clients.append(target_client)
+
+        for dead in dead_clients:
+            connected_clients.discard(dead)
+
+        return {
+            "success": True,
+            **payload_dict
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("UPLOAD PRIVATE AUDIO ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.get("/private-audio/{file_name}")
+async def get_private_audio(file_name: str):
+    safe_name = os.path.basename(file_name)
+    file_path = os.path.join(AUDIO_STORAGE_DIR, safe_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+
+    return FileResponse(file_path)
 
 
 # -------------------------
@@ -694,6 +889,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                         continue
                     peer_id = peer["id"]
+
                 edited_at = int(time.time())
 
                 updated = await conn.fetchrow("""
@@ -870,6 +1066,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "edited_at": inserted["edited_at"],
                 "reply_to_message_id": inserted["reply_to_message_id"],
                 "reply_to_message": reply_preview,
+                "reply_preview": reply_preview,
             })
 
             dead_clients = []
