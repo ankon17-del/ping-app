@@ -121,41 +121,55 @@ def is_username_online(target_username: str) -> bool:
 async def ensure_schema():
     conn = await get_conn()
     try:
-        await conn.execute("""
-            ALTER TABLE messages
-            ADD COLUMN IF NOT EXISTS edited_at BIGINT NULL
-        """)
-        await conn.execute("""
-            ALTER TABLE messages
-            ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
-        """)
-        await conn.execute("""
-            ALTER TABLE private_messages
-            ADD COLUMN IF NOT EXISTS edited_at BIGINT NULL
-        """)
-        await conn.execute("""
-            ALTER TABLE private_messages
-            ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS private_audio_messages (
-                id BIGSERIAL PRIMARY KEY,
-                from_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                to_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                file_name TEXT NOT NULL,
-                original_file_name TEXT NULL,
-                duration_seconds INTEGER NOT NULL DEFAULT 0,
-                created_at BIGINT NOT NULL,
-                is_read BOOLEAN NOT NULL DEFAULT FALSE
+        async with conn.transaction():
+            await conn.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS edited_at BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE private_messages
+                ADD COLUMN IF NOT EXISTS edited_at BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE private_messages
+                ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS private_audio_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    from_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    to_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    file_name TEXT NOT NULL,
+                    original_file_name TEXT NULL,
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at BIGINT NOT NULL,
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+
+        exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'private_audio_messages'
             )
         """)
+        print(f"[DB] private_audio_messages exists: {exists}")
+
     finally:
         await conn.close()
 
 
 @app.on_event("startup")
 async def on_startup():
+    print("[STARTUP] ensure_schema begin")
     await ensure_schema()
+    print("[STARTUP] ensure_schema done")
 
 
 # -------------------------
