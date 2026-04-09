@@ -227,6 +227,9 @@ async def login(data: LoginData):
         stored_password = user["password"]
 
         if verify_password(password_value, stored_password):
+            if is_username_online(user["username"]):
+                return {"success": False, "message": "Пользователь уже авторизован"}
+
             if not is_password_hash(stored_password):
                 new_hash = hash_password(password_value)
                 await conn.execute(
@@ -639,6 +642,10 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
+        if is_username_online(username):
+            await websocket.close()
+            return
+
         connected_clients.add((websocket, user_id, username))
         print(f"User connected: {username} ({user_id})")
 
@@ -830,10 +837,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
 
-                target_user = await conn.fetchrow(
-                    "SELECT id, username FROM users WHERE username=$1",
-                    peer_username
-                )
+                if peer_username == username:
+                    target_user = {"id": user_id, "username": username}
+                else:
+                    target_user = await conn.fetchrow(
+                        "SELECT id, username FROM users WHERE username=$1",
+                        peer_username
+                    )
                 if not target_user:
                     await websocket.send_text(json.dumps({
                         "type": "private_message_edited",
