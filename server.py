@@ -1446,6 +1446,12 @@ async def websocket_endpoint(websocket: WebSocket):
 voice_clients = set()  # (websocket, user_id, username)
 
 
+@app.get("/voice_participants")
+async def get_voice_participants():
+    participants = sorted([uname for _, _, uname in voice_clients], key=lambda v: v.lower())
+    return {"participants": participants}
+
+
 def find_voice_client_by_username(target_username: str):
     for ws, uid, uname in voice_clients:
         if uname == target_username:
