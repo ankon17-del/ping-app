@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -37,6 +37,15 @@ class RegisterData(BaseModel):
 class LoginData(BaseModel):
     username: str
     password: str
+
+
+class PrivateAudioUploadData(BaseModel):
+    sender_user_id: int
+    sender_username: str
+    target_username: str
+    duration_seconds: int = 0
+    audio_data_base64: str
+    original_file_name: str | None = None
 
 
 async def get_conn():
@@ -479,47 +488,45 @@ def build_private_audio_payload(
 
 
 # -------------------------
-# Audio endpoints
+# Audio endpoints (no multipart dependency)
 # -------------------------
 @app.post("/upload_private_audio")
-async def upload_private_audio(
-    sender_user_id: int = Form(...),
-    sender_username: str = Form(...),
-    target_username: str = Form(...),
-    duration_seconds: int = Form(0),
-    audio: UploadFile = File(...),
-):
+async def upload_private_audio(data: PrivateAudioUploadData):
     conn = await get_conn()
     try:
         sender = await conn.fetchrow(
             "SELECT id, username FROM users WHERE id=$1",
-            sender_user_id
+            data.sender_user_id
         )
-        if not sender or sender["username"] != sender_username:
+        if not sender or sender["username"] != data.sender_username:
             raise HTTPException(status_code=400, detail="Invalid sender")
 
         target = await conn.fetchrow(
             "SELECT id, username FROM users WHERE username=$1",
-            target_username
+            data.target_username
         )
         if not target:
             raise HTTPException(status_code=404, detail="Target user not found")
 
         target_user_id = target["id"]
         target_user_name = target["username"]
-        is_self_message = target_user_id == sender_user_id
+        is_self_message = target_user_id == data.sender_user_id
 
-        original_name = audio.filename or "audio_message.bin"
+        original_name = data.original_file_name or "audio_message.webm"
         ext = os.path.splitext(original_name)[1].lower()
         if not ext:
-            ext = ".bin"
+            ext = ".webm"
 
         safe_file_name = f"{uuid.uuid4().hex}{ext}"
         file_path = os.path.join(AUDIO_STORAGE_DIR, safe_file_name)
 
-        file_bytes = await audio.read()
+        try:
+            audio_bytes = base64.b64decode(data.audio_data_base64.encode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid audio_data_base64")
+
         with open(file_path, "wb") as f:
-            f.write(file_bytes)
+            f.write(audio_bytes)
 
         created_at = int(time.time())
 
@@ -536,18 +543,18 @@ async def upload_private_audio(
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, file_name, original_file_name, duration_seconds, created_at
         """,
-            sender_user_id,
+            data.sender_user_id,
             target_user_id,
             safe_file_name,
             original_name,
-            max(0, int(duration_seconds)),
+            max(0, int(data.duration_seconds)),
             created_at,
             True if is_self_message else False
         )
 
         payload_dict = build_private_audio_payload(
             audio_id=inserted["id"],
-            from_username=sender_username,
+            from_username=data.sender_username,
             to_username=target_user_name,
             file_name=inserted["file_name"],
             original_file_name=inserted["original_file_name"],
@@ -558,13 +565,12 @@ async def upload_private_audio(
 
         dead_clients = []
 
-        try:
-            sender_client = find_client_by_username(sender_username)
-            if sender_client:
+        sender_client = find_client_by_username(data.sender_username)
+        if sender_client:
+            try:
                 sender_ws, sender_uid, sender_uname = sender_client
                 await sender_ws.send_text(payload)
-        except Exception:
-            if sender_client:
+            except Exception:
                 dead_clients.append(sender_client)
 
         if not is_self_message:
