@@ -46,6 +46,8 @@ class PrivateAudioUploadData(BaseModel):
     duration_seconds: int = 0
     audio_data_base64: str
     original_file_name: str | None = None
+    reply_to_message_id: int | None = None
+    reply_to_audio_message_id: int | None = None
 
 
 class ChatAudioUploadData(BaseModel):
@@ -54,6 +56,8 @@ class ChatAudioUploadData(BaseModel):
     duration_seconds: int = 0
     audio_data_base64: str
     original_file_name: str | None = None
+    reply_to_message_id: int | None = None
+    reply_to_audio_message_id: int | None = None
 
 
 async def get_conn():
@@ -139,12 +143,20 @@ async def ensure_schema():
                 ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
             """)
             await conn.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS reply_to_audio_message_id BIGINT NULL
+            """)
+            await conn.execute("""
                 ALTER TABLE private_messages
                 ADD COLUMN IF NOT EXISTS edited_at BIGINT NULL
             """)
             await conn.execute("""
                 ALTER TABLE private_messages
                 ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE private_messages
+                ADD COLUMN IF NOT EXISTS reply_to_audio_message_id BIGINT NULL
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS private_audio_messages (
@@ -155,7 +167,9 @@ async def ensure_schema():
                     original_file_name TEXT NULL,
                     duration_seconds INTEGER NOT NULL DEFAULT 0,
                     created_at BIGINT NOT NULL,
-                    is_read BOOLEAN NOT NULL DEFAULT FALSE
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                    reply_to_message_id BIGINT NULL,
+                    reply_to_audio_message_id BIGINT NULL
                 )
             """)
             await conn.execute("""
@@ -165,8 +179,26 @@ async def ensure_schema():
                     file_name TEXT NOT NULL,
                     original_file_name TEXT NULL,
                     duration_seconds INTEGER NOT NULL DEFAULT 0,
-                    created_at BIGINT NOT NULL
+                    created_at BIGINT NOT NULL,
+                    reply_to_message_id BIGINT NULL,
+                    reply_to_audio_message_id BIGINT NULL
                 )
+            """)
+            await conn.execute("""
+                ALTER TABLE private_audio_messages
+                ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE private_audio_messages
+                ADD COLUMN IF NOT EXISTS reply_to_audio_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE audio_messages
+                ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL
+            """)
+            await conn.execute("""
+                ALTER TABLE audio_messages
+                ADD COLUMN IF NOT EXISTS reply_to_audio_message_id BIGINT NULL
             """)
 
         private_exists = await conn.fetchval("""
@@ -518,23 +550,50 @@ async def get_chat_message_reply_preview(conn, reply_to_message_id):
     }
 
 
-async def get_private_message_reply_preview(conn, reply_to_message_id):
-    if not reply_to_message_id:
+async def get_chat_audio_reply_preview(conn, reply_to_audio_message_id):
+    if not reply_to_audio_message_id:
         return None
 
     row = await conn.fetchrow("""
         SELECT
-            pm.id,
-            pm.text,
-            pm.created_at,
-            pm.edited_at,
+            am.id,
+            am.duration_seconds,
+            am.created_at,
+            u.username
+        FROM audio_messages am
+        JOIN users u ON am.user_id = u.id
+        WHERE am.id = $1
+    """, int(reply_to_audio_message_id))
+
+    if not row:
+        return None
+
+    return {
+        "message_id": row["id"],
+        "username": row["username"],
+        "text": f"▶ Аудио {int(row['duration_seconds']) // 60}:{int(row['duration_seconds']) % 60:02d}",
+        "created_at": row["created_at"],
+        "edited_at": None,
+        "is_audio": True,
+    }
+
+
+async def get_private_audio_reply_preview(conn, reply_to_audio_message_id):
+    if not reply_to_audio_message_id:
+        return None
+
+    row = await conn.fetchrow("""
+        SELECT
+            pam.id,
+            pam.duration_seconds,
+            pam.created_at,
             sender.username AS from_username,
             receiver.username AS to_username
-        FROM private_messages pm
-        JOIN users sender ON pm.from_user_id = sender.id
-        JOIN users receiver ON pm.to_user_id = receiver.id
-        WHERE pm.id = $1
-    """, int(reply_to_message_id))
+        FROM private_audio_messages pam
+        JOIN users sender ON pam.from_user_id = sender.id
+        JOIN users receiver ON pam.to_user_id = receiver.id
+        WHERE pam.id = $1
+    """, int(reply_to_audio_message_id))
 
     if not row:
         return None
@@ -543,10 +602,23 @@ async def get_private_message_reply_preview(conn, reply_to_message_id):
         "message_id": row["id"],
         "from_username": row["from_username"],
         "to_username": row["to_username"],
-        "text": row["text"],
+        "text": f"▶ Аудио {int(row['duration_seconds']) // 60}:{int(row['duration_seconds']) % 60:02d}",
         "created_at": row["created_at"],
-        "edited_at": row["edited_at"],
+        "edited_at": None,
+        "is_audio": True,
     }
+
+
+async def get_chat_reply_preview(conn, reply_to_message_id=None, reply_to_audio_message_id=None):
+    if reply_to_audio_message_id:
+        return await get_chat_audio_reply_preview(conn, reply_to_audio_message_id)
+    return await get_chat_message_reply_preview(conn, reply_to_message_id)
+
+
+async def get_private_reply_preview(conn, reply_to_message_id=None, reply_to_audio_message_id=None):
+    if reply_to_audio_message_id:
+        return await get_private_audio_reply_preview(conn, reply_to_audio_message_id)
+    return await get_private_message_reply_preview(conn, reply_to_message_id)
 
 
 # -------------------------
@@ -598,10 +670,12 @@ async def upload_private_audio(data: PrivateAudioUploadData):
                 original_file_name,
                 duration_seconds,
                 created_at,
-                is_read
+                is_read,
+                reply_to_message_id,
+                reply_to_audio_message_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, file_name, original_file_name, duration_seconds, created_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, file_name, original_file_name, duration_seconds, created_at, reply_to_message_id, reply_to_audio_message_id
         """,
             data.sender_user_id,
             target_user_id,
@@ -609,8 +683,12 @@ async def upload_private_audio(data: PrivateAudioUploadData):
             original_name,
             max(0, int(data.duration_seconds)),
             created_at,
-            True if is_self_message else False
+            True if is_self_message else False,
+            int(data.reply_to_message_id) if data.reply_to_message_id is not None else None,
+            int(data.reply_to_audio_message_id) if data.reply_to_audio_message_id is not None else None
         )
+
+        reply_preview = await get_private_reply_preview(conn, inserted["reply_to_message_id"], inserted["reply_to_audio_message_id"])
 
         payload_dict = build_private_audio_payload(
             audio_id=inserted["id"],
@@ -621,6 +699,14 @@ async def upload_private_audio(data: PrivateAudioUploadData):
             duration_seconds=int(inserted["duration_seconds"]),
             created_at=int(inserted["created_at"]),
         )
+        payload_dict["reply_to_message_id"] = inserted.get("reply_to_message_id")
+        payload_dict["reply_to_audio_message_id"] = inserted.get("reply_to_audio_message_id")
+        payload_dict["reply_preview"] = reply_preview
+        payload_dict["reply_to_message"] = reply_preview
+        payload_dict["reply_to_message_id"] = inserted.get("reply_to_message_id")
+        payload_dict["reply_to_audio_message_id"] = inserted.get("reply_to_audio_message_id")
+        payload_dict["reply_preview"] = reply_preview
+        payload_dict["reply_to_message"] = reply_preview
         payload = json.dumps(payload_dict)
 
         dead_clients = []
@@ -693,17 +779,23 @@ async def upload_chat_audio(data: ChatAudioUploadData):
                 file_name,
                 original_file_name,
                 duration_seconds,
-                created_at
+                created_at,
+                reply_to_message_id,
+                reply_to_audio_message_id
             )
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, file_name, original_file_name, duration_seconds, created_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, file_name, original_file_name, duration_seconds, created_at, reply_to_message_id, reply_to_audio_message_id
         """,
             data.sender_user_id,
             safe_file_name,
             original_name,
             max(0, int(data.duration_seconds)),
-            created_at
+            created_at,
+            int(data.reply_to_message_id) if data.reply_to_message_id is not None else None,
+            int(data.reply_to_audio_message_id) if data.reply_to_audio_message_id is not None else None
         )
+
+        reply_preview = await get_chat_reply_preview(conn, inserted["reply_to_message_id"], inserted["reply_to_audio_message_id"])
 
         payload_dict = build_chat_audio_payload(
             audio_id=inserted["id"],
@@ -798,6 +890,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 messages.created_at,
                 messages.edited_at,
                 messages.reply_to_message_id,
+                messages.reply_to_audio_message_id,
                 users.username
             FROM messages
             JOIN users ON messages.user_id = users.id
@@ -805,7 +898,7 @@ async def websocket_endpoint(websocket: WebSocket):
             LIMIT 1000
         """)
         for row in reversed(rows):
-            reply_preview = await get_chat_message_reply_preview(conn, row["reply_to_message_id"])
+            reply_preview = await get_chat_reply_preview(conn, row["reply_to_message_id"], row.get("reply_to_audio_message_id") if hasattr(row, "get") else None)
             await websocket.send_text(json.dumps({
                 "type": "chat_message",
                 "message_id": row["id"],
@@ -825,6 +918,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 am.original_file_name,
                 am.duration_seconds,
                 am.created_at,
+                am.reply_to_message_id,
+                am.reply_to_audio_message_id,
                 u.username
             FROM audio_messages am
             JOIN users u ON am.user_id = u.id
@@ -832,6 +927,7 @@ async def websocket_endpoint(websocket: WebSocket):
             LIMIT 1000
         """)
         for row in reversed(chat_audio_rows):
+            reply_preview = await get_chat_reply_preview(conn, row["reply_to_message_id"], row["reply_to_audio_message_id"])
             await websocket.send_text(json.dumps({
                 "type": "chat_audio_message",
                 "audio_id": row["id"],
@@ -840,6 +936,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 "original_file_name": row["original_file_name"],
                 "duration_seconds": row["duration_seconds"],
                 "created_at": row["created_at"],
+                "reply_to_message_id": row["reply_to_message_id"],
+                "reply_to_audio_message_id": row["reply_to_audio_message_id"],
+                "reply_preview": reply_preview,
+                "reply_to_message": reply_preview,
                 "audio_url": f"/audio/{row['file_name']}",
             }))
 
@@ -850,6 +950,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 pm.created_at,
                 pm.edited_at,
                 pm.reply_to_message_id,
+                pm.reply_to_audio_message_id,
                 sender.username AS from_username,
                 receiver.username AS to_username
             FROM private_messages pm
@@ -860,7 +961,7 @@ async def websocket_endpoint(websocket: WebSocket):
         """, user_id)
 
         for row in private_rows:
-            reply_preview = await get_private_message_reply_preview(conn, row["reply_to_message_id"])
+            reply_preview = await get_private_reply_preview(conn, row["reply_to_message_id"], row.get("reply_to_audio_message_id") if hasattr(row, "get") else None)
             await websocket.send_text(json.dumps({
                 "type": "private_message",
                 "message_id": row["id"],
@@ -881,6 +982,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 pam.original_file_name,
                 pam.duration_seconds,
                 pam.created_at,
+                pam.reply_to_message_id,
+                pam.reply_to_audio_message_id,
                 sender.username AS from_username,
                 receiver.username AS to_username
             FROM private_audio_messages pam
@@ -891,6 +994,7 @@ async def websocket_endpoint(websocket: WebSocket):
         """, user_id)
 
         for row in private_audio_rows:
+            reply_preview = await get_private_reply_preview(conn, row["reply_to_message_id"], row["reply_to_audio_message_id"])
             await websocket.send_text(json.dumps({
                 "type": "private_audio_message",
                 "audio_id": row["id"],
@@ -900,6 +1004,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 "original_file_name": row["original_file_name"],
                 "duration_seconds": row["duration_seconds"],
                 "created_at": row["created_at"],
+                "reply_to_message_id": row["reply_to_message_id"],
+                "reply_to_audio_message_id": row["reply_to_audio_message_id"],
+                "reply_preview": reply_preview,
+                "reply_to_message": reply_preview,
                 "audio_url": f"/audio/{row['file_name']}",
             }))
 
@@ -1024,7 +1132,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     UPDATE messages
                     SET text = $1, edited_at = $2
                     WHERE id = $3 AND user_id = $4
-                    RETURNING id, text, created_at, edited_at, reply_to_message_id
+                    RETURNING id, text, created_at, edited_at, reply_to_message_id, reply_to_audio_message_id
                 """, new_text, edited_at, int(message_id), user_id)
 
                 if not updated:
@@ -1035,7 +1143,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
 
-                reply_preview = await get_chat_message_reply_preview(conn, updated["reply_to_message_id"])
+                reply_preview = await get_chat_reply_preview(conn, updated["reply_to_message_id"], updated["reply_to_audio_message_id"])
 
                 payload = json.dumps({
                     "type": "chat_message_edited",
@@ -1046,6 +1154,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "created_at": updated["created_at"],
                     "edited_at": updated["edited_at"],
                     "reply_to_message_id": updated["reply_to_message_id"],
+                    "reply_to_audio_message_id": updated["reply_to_audio_message_id"],
                     "reply_to_message": reply_preview,
                     "reply_preview": reply_preview,
                 })
@@ -1097,7 +1206,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     WHERE id = $3
                       AND from_user_id = $4
                       AND to_user_id = $5
-                    RETURNING id, text, created_at, edited_at, reply_to_message_id
+                    RETURNING id, text, created_at, edited_at, reply_to_message_id, reply_to_audio_message_id
                 """, new_text, edited_at, int(message_id), user_id, peer_id)
 
                 if not updated:
@@ -1108,7 +1217,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
 
-                reply_preview = await get_private_message_reply_preview(conn, updated["reply_to_message_id"])
+                reply_preview = await get_private_reply_preview(conn, updated["reply_to_message_id"], updated["reply_to_audio_message_id"])
 
                 payload = json.dumps({
                     "type": "private_message_edited",
@@ -1120,6 +1229,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "created_at": updated["created_at"],
                     "edited_at": updated["edited_at"],
                     "reply_to_message_id": updated["reply_to_message_id"],
+                    "reply_to_audio_message_id": updated["reply_to_audio_message_id"],
                     "reply_to_message": reply_preview,
                     "reply_preview": reply_preview,
                 })
@@ -1163,6 +1273,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             created_at = int(time.time())
             reply_to_message_id = data.get("reply_to_message_id")
+            reply_to_audio_message_id = data.get("reply_to_audio_message_id")
             target_username = data.get("target_username")
 
             if target_username:
@@ -1190,20 +1301,22 @@ async def websocket_endpoint(websocket: WebSocket):
                         text,
                         created_at,
                         is_read,
-                        reply_to_message_id
+                        reply_to_message_id,
+                        reply_to_audio_message_id
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    RETURNING id, text, created_at, edited_at, reply_to_message_id
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id, text, created_at, edited_at, reply_to_message_id, reply_to_audio_message_id
                 """,
                     user_id,
                     target_uid,
                     text,
                     created_at,
                     True if is_self_message else False,
-                    int(reply_to_message_id) if reply_to_message_id is not None else None
+                    int(reply_to_message_id) if reply_to_message_id is not None else None,
+                    int(reply_to_audio_message_id) if reply_to_audio_message_id is not None else None
                 )
 
-                reply_preview = await get_private_message_reply_preview(conn, inserted["reply_to_message_id"])
+                reply_preview = await get_private_reply_preview(conn, inserted["reply_to_message_id"], inserted["reply_to_audio_message_id"])
 
                 private_payload = json.dumps({
                     "type": "private_message",
@@ -1214,6 +1327,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "created_at": inserted["created_at"],
                     "edited_at": inserted["edited_at"],
                     "reply_to_message_id": inserted["reply_to_message_id"],
+                    "reply_to_audio_message_id": inserted["reply_to_audio_message_id"],
                     "reply_to_message": reply_preview,
                     "reply_preview": reply_preview,
                 })
@@ -1244,17 +1358,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             inserted = await conn.fetchrow("""
-                INSERT INTO messages (user_id, text, created_at, reply_to_message_id)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, text, created_at, edited_at, reply_to_message_id
+                INSERT INTO messages (user_id, text, created_at, reply_to_message_id, reply_to_audio_message_id)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, text, created_at, edited_at, reply_to_message_id, reply_to_audio_message_id
             """,
                 user_id,
                 text,
                 created_at,
-                int(reply_to_message_id) if reply_to_message_id is not None else None
+                int(reply_to_message_id) if reply_to_message_id is not None else None,
+                int(reply_to_audio_message_id) if reply_to_audio_message_id is not None else None
             )
 
-            reply_preview = await get_chat_message_reply_preview(conn, inserted["reply_to_message_id"])
+            reply_preview = await get_chat_reply_preview(conn, inserted["reply_to_message_id"], inserted["reply_to_audio_message_id"])
 
             message_to_send = json.dumps({
                 "type": "chat_message",
@@ -1264,6 +1379,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": inserted["created_at"],
                 "edited_at": inserted["edited_at"],
                 "reply_to_message_id": inserted["reply_to_message_id"],
+                "reply_to_audio_message_id": inserted["reply_to_audio_message_id"],
                 "reply_to_message": reply_preview,
                 "reply_preview": reply_preview,
             })
