@@ -550,6 +550,37 @@ async def get_chat_message_reply_preview(conn, reply_to_message_id):
     }
 
 
+async def get_private_message_reply_preview(conn, reply_to_message_id):
+    if not reply_to_message_id:
+        return None
+
+    row = await conn.fetchrow("""
+        SELECT
+            pm.id,
+            pm.text,
+            pm.created_at,
+            pm.edited_at,
+            sender.username AS from_username,
+            receiver.username AS to_username
+        FROM private_messages pm
+        JOIN users sender ON pm.from_user_id = sender.id
+        JOIN users receiver ON pm.to_user_id = receiver.id
+        WHERE pm.id = $1
+    """, int(reply_to_message_id))
+
+    if not row:
+        return None
+
+    return {
+        "message_id": row["id"],
+        "from_username": row["from_username"],
+        "to_username": row["to_username"],
+        "text": row["text"],
+        "created_at": row["created_at"],
+        "edited_at": row["edited_at"],
+    }
+
+
 async def get_chat_audio_reply_preview(conn, reply_to_audio_message_id):
     if not reply_to_audio_message_id:
         return None
