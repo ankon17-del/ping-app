@@ -724,6 +724,35 @@ async def websocket_endpoint(websocket: WebSocket):
                 "reply_preview": reply_preview,
             }))
 
+        private_audio_rows = await conn.fetch("""
+            SELECT
+                pam.id,
+                pam.file_name,
+                pam.original_file_name,
+                pam.duration_seconds,
+                pam.created_at,
+                sender.username AS from_username,
+                receiver.username AS to_username
+            FROM private_audio_messages pam
+            JOIN users sender ON pam.from_user_id = sender.id
+            JOIN users receiver ON pam.to_user_id = receiver.id
+            WHERE pam.from_user_id = $1 OR pam.to_user_id = $1
+            ORDER BY pam.id ASC
+        """, user_id)
+
+        for row in private_audio_rows:
+            await websocket.send_text(json.dumps({
+                "type": "private_audio_message",
+                "audio_id": row["id"],
+                "from_username": row["from_username"],
+                "to_username": row["to_username"],
+                "file_name": row["file_name"],
+                "original_file_name": row["original_file_name"],
+                "duration_seconds": row["duration_seconds"],
+                "created_at": row["created_at"],
+                "audio_url": f"/private-audio/{row['file_name']}",
+            }))
+
         await send_unread_private_counts(websocket, conn, user_id)
         await broadcast_online_status()
 
