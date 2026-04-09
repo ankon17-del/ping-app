@@ -475,6 +475,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "edited_at": row["edited_at"],
                 "reply_to_message_id": row["reply_to_message_id"],
                 "reply_to_message": reply_preview,
+                "reply_preview": reply_preview,
             }))
 
         private_rows = await conn.fetch("""
@@ -505,6 +506,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "edited_at": row["edited_at"],
                 "reply_to_message_id": row["reply_to_message_id"],
                 "reply_to_message": reply_preview,
+                "reply_preview": reply_preview,
             }))
 
         await send_unread_private_counts(websocket, conn, user_id)
@@ -651,6 +653,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "edited_at": updated["edited_at"],
                     "reply_to_message_id": updated["reply_to_message_id"],
                     "reply_to_message": reply_preview,
+                    "reply_preview": reply_preview,
                 })
 
                 dead_clients = []
@@ -676,19 +679,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
 
-                peer = await conn.fetchrow(
-                    "SELECT id FROM users WHERE username=$1",
-                    peer_username
-                )
-                if not peer:
-                    await websocket.send_text(json.dumps({
-                        "type": "private_message_edited",
-                        "success": False,
-                        "message": "Не удалось отредактировать личное сообщение"
-                    }))
-                    continue
-
-                peer_id = peer["id"]
+                if peer_username == username or peer_username == "Избранное":
+                    peer_id = user_id
+                else:
+                    peer = await conn.fetchrow(
+                        "SELECT id FROM users WHERE username=$1",
+                        peer_username
+                    )
+                    if not peer:
+                        await websocket.send_text(json.dumps({
+                            "type": "private_message_edited",
+                            "success": False,
+                            "message": "Не удалось отредактировать личное сообщение"
+                        }))
+                        continue
+                    peer_id = peer["id"]
                 edited_at = int(time.time())
 
                 updated = await conn.fetchrow("""
@@ -721,6 +726,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "edited_at": updated["edited_at"],
                     "reply_to_message_id": updated["reply_to_message_id"],
                     "reply_to_message": reply_preview,
+                    "reply_preview": reply_preview,
                 })
 
                 try:
@@ -814,6 +820,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "edited_at": inserted["edited_at"],
                     "reply_to_message_id": inserted["reply_to_message_id"],
                     "reply_to_message": reply_preview,
+                    "reply_preview": reply_preview,
                 })
 
                 dead_clients = []
