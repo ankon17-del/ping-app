@@ -584,17 +584,23 @@ async def get_private_message_reply_preview(conn, reply_to_message_id):
 async def get_chat_audio_reply_preview(conn, reply_to_audio_message_id):
     if not reply_to_audio_message_id:
         return None
+
     row = await conn.fetchrow("""
-        SELECT am.id, am.duration_seconds, am.created_at, u.username
+        SELECT
+            am.id,
+            am.duration_seconds,
+            am.created_at,
+            u.username
         FROM audio_messages am
         JOIN users u ON am.user_id = u.id
         WHERE am.id = $1
     """, int(reply_to_audio_message_id))
+
     if not row:
         return None
+
     return {
         "message_id": row["id"],
-        "audio_id": row["id"],
         "username": row["username"],
         "text": f"▶ Аудио {int(row['duration_seconds']) // 60}:{int(row['duration_seconds']) % 60:02d}",
         "created_at": row["created_at"],
@@ -606,20 +612,25 @@ async def get_chat_audio_reply_preview(conn, reply_to_audio_message_id):
 async def get_private_audio_reply_preview(conn, reply_to_audio_message_id):
     if not reply_to_audio_message_id:
         return None
+
     row = await conn.fetchrow("""
-        SELECT pam.id, pam.duration_seconds, pam.created_at,
-               sender.username AS from_username,
-               receiver.username AS to_username
+        SELECT
+            pam.id,
+            pam.duration_seconds,
+            pam.created_at,
+            sender.username AS from_username,
+            receiver.username AS to_username
         FROM private_audio_messages pam
         JOIN users sender ON pam.from_user_id = sender.id
         JOIN users receiver ON pam.to_user_id = receiver.id
         WHERE pam.id = $1
     """, int(reply_to_audio_message_id))
+
     if not row:
         return None
+
     return {
         "message_id": row["id"],
-        "audio_id": row["id"],
         "from_username": row["from_username"],
         "to_username": row["to_username"],
         "text": f"▶ Аудио {int(row['duration_seconds']) // 60}:{int(row['duration_seconds']) % 60:02d}",
@@ -719,12 +730,12 @@ async def upload_private_audio(data: PrivateAudioUploadData):
             duration_seconds=int(inserted["duration_seconds"]),
             created_at=int(inserted["created_at"]),
         )
-        payload_dict["reply_to_message_id"] = inserted["reply_to_message_id"]
-        payload_dict["reply_to_audio_message_id"] = inserted["reply_to_audio_message_id"]
+        payload_dict["reply_to_message_id"] = inserted.get("reply_to_message_id")
+        payload_dict["reply_to_audio_message_id"] = inserted.get("reply_to_audio_message_id")
         payload_dict["reply_preview"] = reply_preview
         payload_dict["reply_to_message"] = reply_preview
-        payload_dict["reply_to_message_id"] = inserted["reply_to_message_id"]
-        payload_dict["reply_to_audio_message_id"] = inserted["reply_to_audio_message_id"]
+        payload_dict["reply_to_message_id"] = inserted.get("reply_to_message_id")
+        payload_dict["reply_to_audio_message_id"] = inserted.get("reply_to_audio_message_id")
         payload_dict["reply_preview"] = reply_preview
         payload_dict["reply_to_message"] = reply_preview
         payload = json.dumps(payload_dict)
@@ -918,7 +929,7 @@ async def websocket_endpoint(websocket: WebSocket):
             LIMIT 1000
         """)
         for row in reversed(rows):
-            reply_preview = await get_chat_reply_preview(conn, row["reply_to_message_id"], row["reply_to_audio_message_id"])
+            reply_preview = await get_chat_reply_preview(conn, row["reply_to_message_id"], row.get("reply_to_audio_message_id") if hasattr(row, "get") else None)
             await websocket.send_text(json.dumps({
                 "type": "chat_message",
                 "message_id": row["id"],
@@ -927,7 +938,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": row["created_at"],
                 "edited_at": row["edited_at"],
                 "reply_to_message_id": row["reply_to_message_id"],
-                "reply_to_audio_message_id": row["reply_to_audio_message_id"],
                 "reply_to_message": reply_preview,
                 "reply_preview": reply_preview,
             }))
@@ -982,7 +992,7 @@ async def websocket_endpoint(websocket: WebSocket):
         """, user_id)
 
         for row in private_rows:
-            reply_preview = await get_private_reply_preview(conn, row["reply_to_message_id"], row["reply_to_audio_message_id"])
+            reply_preview = await get_private_reply_preview(conn, row["reply_to_message_id"], row.get("reply_to_audio_message_id") if hasattr(row, "get") else None)
             await websocket.send_text(json.dumps({
                 "type": "private_message",
                 "message_id": row["id"],
@@ -992,7 +1002,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "created_at": row["created_at"],
                 "edited_at": row["edited_at"],
                 "reply_to_message_id": row["reply_to_message_id"],
-                "reply_to_audio_message_id": row["reply_to_audio_message_id"],
                 "reply_to_message": reply_preview,
                 "reply_preview": reply_preview,
             }))
@@ -1426,5 +1435,130 @@ async def websocket_endpoint(websocket: WebSocket):
 
             await broadcast_system_message(f"{username} вышел из чата")
             await broadcast_online_status()
+
+        await conn.close()
+
+
+
+# -------------------------
+# Voice room MVP
+# -------------------------
+voice_clients = set()  # (websocket, user_id, username)
+
+
+def find_voice_client_by_username(target_username: str):
+    for ws, uid, uname in voice_clients:
+        if uname == target_username:
+            return ws, uid, uname
+    return None
+
+
+async def broadcast_voice_participants():
+    participants = sorted([uname for _, _, uname in voice_clients], key=lambda v: v.lower())
+    payload = json.dumps({
+        "type": "voice_participants",
+        "participants": participants
+    })
+
+    dead_clients = []
+    for ws, uid, uname in voice_clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead_clients.append((ws, uid, uname))
+
+    for dead in dead_clients:
+        voice_clients.discard(dead)
+
+
+@app.websocket("/voice")
+async def voice_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    conn = await get_conn()
+
+    user_id = None
+    username = None
+
+    try:
+        auth_raw = await websocket.receive_text()
+        auth = json.loads(auth_raw)
+
+        user_id = auth.get("user_id")
+        username = auth.get("username")
+
+        if not user_id or not username:
+            await websocket.close()
+            return
+
+        user = await conn.fetchrow(
+            "SELECT id, username FROM users WHERE id=$1",
+            user_id
+        )
+        if not user or user["username"] != username:
+            await websocket.close()
+            return
+
+        existing_voice_client = find_voice_client_by_username(username)
+        if existing_voice_client:
+            await websocket.send_text(json.dumps({
+                "type": "voice_auth_error",
+                "message": "Пользователь уже в голосовой комнате"
+            }))
+            await websocket.close()
+            return
+
+        voice_clients.add((websocket, user_id, username))
+        print(f"Voice connected: {username} ({user_id})")
+        await broadcast_voice_participants()
+
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+
+            if data.get("type") == "voice_ping":
+                await websocket.send_text(json.dumps({"type": "voice_pong"}))
+                continue
+
+            if data.get("type") == "voice_chunk":
+                payload = json.dumps({
+                    "type": "voice_chunk",
+                    "username": username,
+                    "sample_rate": data.get("sample_rate", 16000),
+                    "channels": data.get("channels", 1),
+                    "chunk_ms": data.get("chunk_ms", 20),
+                    "audio_base64": data.get("audio_base64", "")
+                })
+
+                dead_clients = []
+                for ws, uid, uname in voice_clients:
+                    if ws == websocket:
+                        continue
+                    try:
+                        await ws.send_text(payload)
+                    except Exception:
+                        dead_clients.append((ws, uid, uname))
+
+                for dead in dead_clients:
+                    voice_clients.discard(dead)
+
+                if dead_clients:
+                    await broadcast_voice_participants()
+
+                continue
+
+    except Exception as e:
+        print("Voice WebSocket error:", e)
+
+    finally:
+        if user_id and username:
+            dead = None
+            for item in list(voice_clients):
+                if item[0] == websocket:
+                    dead = item
+                    break
+            if dead:
+                voice_clients.discard(dead)
+                print(f"Voice disconnected: {username} ({user_id})")
+                await broadcast_voice_participants()
 
         await conn.close()
